@@ -19,6 +19,7 @@ jobs:
       - name: Close issues linked to merged dev PR
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.AUTO_MERGE_TOKEN || github.token }}
           script: |
             const pr = context.payload.pull_request;
             const owner = context.repo.owner;
@@ -59,50 +60,69 @@ jobs:
 
             const closed = [];
             const skipped = [];
+            const failures = [];
 
             for (const { number, source } of refs.values()) {
-              const { data: issue } = await github.rest.issues.get({
-                owner,
-                repo,
-                issue_number: number,
-              });
+              try {
+                const { data: issue } = await github.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: number,
+                });
 
-              if (issue.pull_request) {
-                skipped.push(`#${number} is a pull request`);
-                continue;
+                if (issue.pull_request) {
+                  skipped.push(`#${number} is a pull request`);
+                  continue;
+                }
+
+                if (issue.state === 'closed') {
+                  skipped.push(`#${number} was already closed`);
+                  continue;
+                }
+
+                try {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: number,
+                    body: `Closed automatically because PR #${pr.number} was merged into dev. Source: ${source}.`,
+                  });
+                } catch (commentError) {
+                  core.warning(`Could not comment on #${number}: ${commentError.message}`);
+                }
+
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: number,
+                  state: 'closed',
+                  state_reason: 'completed',
+                });
+
+                closed.push(`#${number}`);
+              } catch (error) {
+                failures.push(`#${number}: ${error.message}`);
+                core.warning(`Could not close #${number}: ${error.message}`);
               }
-
-              if (issue.state === 'closed') {
-                skipped.push(`#${number} was already closed`);
-                continue;
-              }
-
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: number,
-                body: `Closed automatically because PR #${pr.number} was merged into dev. Source: ${source}.`,
-              });
-
-              await github.rest.issues.update({
-                owner,
-                repo,
-                issue_number: number,
-                state: 'closed',
-                state_reason: 'completed',
-              });
-
-              closed.push(`#${number}`);
             }
 
-            if (closed.length > 0 || skipped.length > 0) {
+            if (closed.length > 0 || skipped.length > 0 || failures.length > 0) {
               const lines = [];
               if (closed.length > 0) lines.push(`Closed linked issue(s): ${closed.join(', ')}.`);
               if (skipped.length > 0) lines.push(`Skipped: ${skipped.join(', ')}.`);
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: pr.number,
-                body: lines.join('\n'),
-              });
+              if (failures.length > 0) lines.push(`Could not close: ${failures.join(', ')}.`);
+              try {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  body: lines.join('\n'),
+                });
+              } catch (commentError) {
+                core.warning(`Could not comment on PR #${pr.number}: ${commentError.message}`);
+              }
+            }
+
+            if (closed.length === 0 && failures.length > 0) {
+              core.setFailed(`No linked issues were closed. Failures: ${failures.join(', ')}`);
             }
