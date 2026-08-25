@@ -185,7 +185,11 @@ pub fn write_v1_payroll_run_fixture(
     employee_count: u32,
     status: ReconciliationStatus,
 ) -> PayrollRunFixture {
-    let timestamp = env.ledger().timestamp();
+    let timestamp = if env.ledger().timestamp() == 0 {
+        1_000_000 + run_id
+    } else {
+        env.ledger().timestamp()
+    };
 
     let run = PayrollRun {
         run_id,
@@ -217,7 +221,11 @@ pub fn write_v1_pending_run_fixture(
     total_amount: i128,
     employee_count: u32,
 ) {
-    let timestamp = env.ledger().timestamp();
+    let timestamp = if env.ledger().timestamp() == 0 {
+        1_000_000 + run_id
+    } else {
+        env.ledger().timestamp()
+    };
 
     let pending = PendingPayrollRun {
         run_id,
@@ -376,10 +384,15 @@ pub fn write_v1_emergency_withdrawal(
     amount: i128,
     recipient: &Address,
 ) {
+    let timestamp = if env.ledger().timestamp() == 0 {
+        500_000
+    } else {
+        env.ledger().timestamp()
+    };
     let request = EmergencyWithdrawalRequest {
         amount,
         recipient: recipient.clone(),
-        requested_at: env.ledger().timestamp(),
+        requested_at: timestamp,
         approved: false,
     };
 

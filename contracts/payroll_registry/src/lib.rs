@@ -54,6 +54,20 @@ pub struct PendingCompanyRotation {
     pub proposed_at: u64,
 }
 
+// ── Issue #329: employer-level payroll policy ───────────────────────────────
+
+/// Employer-level payroll policy configuration (issue #329).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayrollPolicy {
+    pub company_id: u64,
+    pub settlement_window: u64,
+    pub reserve_ratio_bps: u32,
+    pub approval_threshold: u32,
+    pub audit_retention_period: u64,
+    pub auto_settlement_enabled: bool,
+}
+
 /// Storage key space for the payroll registry.
 ///
 /// - `Company(u64)`               → `CompanyInfo`              (Persistent)
@@ -62,6 +76,7 @@ pub struct PendingCompanyRotation {
 /// - `CompanySequence`            → `u64`                      (Persistent, counter)
 /// - `PendingAdminRotation(u64)`  → `PendingCompanyRotation`   (Persistent, issue #91)
 /// - `PendingTreasuryRotation(u64)` → `PendingCompanyRotation` (Persistent, issue #91)
+/// - `PayrollPolicy(u64)`         → `PayrollPolicy`            (Persistent, issue #329)
 #[contracttype]
 pub enum DataKey {
     Company(u64),
@@ -77,6 +92,8 @@ pub enum DataKey {
     CompanyAdmin(Address),
     /// Pause manager address (issue #167).
     PauseManager,
+    /// Employer-level payroll policy (issue #329).
+    PayrollPolicy(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +178,15 @@ pub trait PayrollRegistryTrait {
 
     /// Cancel a pending treasury rotation.
     fn cancel_treasury_rotation(env: Env, company_id: u64, current_admin: Address);
+
+    // ── Issue #329: Employer-level payroll policy registry ───────────────────
+
+    /// Configure or update employer-level payroll policy.
+    /// Requires authorisation from the company admin.
+    fn set_payroll_policy(env: Env, company_id: u64, policy: PayrollPolicy);
+
+    /// Retrieve employer-level payroll policy if configured.
+    fn get_payroll_policy(env: Env, company_id: u64) -> Option<PayrollPolicy>;
 }
 
 // ---------------------------------------------------------------------------
@@ -701,6 +727,54 @@ impl PayrollRegistryTrait for PayrollRegistry {
             (Symbol::new(&env, "TreasuryRotationCancelled"), company_id),
             (current_admin,),
         );
+    }
+
+    // ── Issue #329: Employer-level payroll policy registry ───────────────────
+
+    fn set_payroll_policy(env: Env, company_id: u64, policy: PayrollPolicy) {
+        Self::require_not_paused(&env);
+        let info: CompanyInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Company(company_id))
+            .expect("Company not found");
+        info.admin.require_auth();
+
+        if policy.company_id != company_id {
+            panic!("Company ID in policy does not match target company");
+        }
+        if policy.settlement_window == 0 {
+            panic!("Settlement window must be greater than 0");
+        }
+        if policy.reserve_ratio_bps > 10_000 {
+            panic!("Reserve ratio bps cannot exceed 10000");
+        }
+        if policy.approval_threshold == 0 {
+            panic!("Approval threshold must be greater than 0");
+        }
+        if policy.audit_retention_period == 0 {
+            panic!("Audit retention period must be greater than 0");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PayrollPolicy(company_id), &policy);
+
+        payroll_events::emit_payroll_policy_set(
+            &env,
+            company_id,
+            policy.settlement_window,
+            policy.reserve_ratio_bps,
+            policy.approval_threshold,
+            policy.audit_retention_period,
+            policy.auto_settlement_enabled,
+        );
+    }
+
+    fn get_payroll_policy(env: Env, company_id: u64) -> Option<PayrollPolicy> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PayrollPolicy(company_id))
     }
 }
 

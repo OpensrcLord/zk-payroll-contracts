@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token as soroban_token, Address, BytesN, Env, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, token as soroban_token, Address, BytesN,
+    Env, Symbol, Vec,
 };
 
 use pause_manager::PauseManagerClient;
@@ -304,6 +305,8 @@ pub enum DataKey {
     CompanyState,
     /// Canonical payroll run state for SDK/dashboard conformance (#159).
     PayrollState(u64),
+    /// Allowed token asset for payroll payments (#178).
+    AllowedAsset(Address),
     // Future upgrade example (issue #196):
     // PayrollRunV2(u64),  // Would be added here when schema evolution is needed
 }
@@ -976,7 +979,7 @@ impl Payroll {
     ///
     /// Issue #218: Added explicit validation that the run is still pending
     /// and proper state cleanup to prevent cancel-after-submit race conditions.
-    pub fn cancel_payroll_run(e: Env, admin: Address, run_id: u64) {
+    pub fn finalize_payroll_run(e: Env, admin: Address, run_id: u64) {
         Self::require_not_paused(&e);
         let addrs: ContractAddresses = e
             .storage()
@@ -1004,7 +1007,7 @@ impl Payroll {
 
         // Remove the pending run from storage
         e.storage().persistent().remove(&pending_key);
-        Self::record_payroll_run_state(&e, run_id, PayrollRunState::Cancelled);
+        Self::record_payroll_run_state(&e, run_id, PayrollRunState::Completed);
 
         let run = PayrollRun {
             run_id,
@@ -1067,6 +1070,7 @@ impl Payroll {
 
         // Remove the pending run from storage
         e.storage().persistent().remove(&pending_key);
+        Self::record_payroll_run_state(&e, run_id, PayrollRunState::Cancelled);
 
         // Emit cancellation event with reason for audit trail
         e.events().publish(
@@ -2861,7 +2865,7 @@ mod tests {
             PayrollRunState::Submitted
         );
 
-        payroll_client.cancel_payroll_run(&admin, &run_id);
+        payroll_client.cancel_payroll_run(&admin, &run_id, &Symbol::new(&env, "cancelled"));
         assert_eq!(
             payroll_client.get_payroll_run_state(&run_id),
             PayrollRunState::Cancelled
@@ -2883,7 +2887,7 @@ mod tests {
             &test_nonce(&env, 151),
             &None,
         );
-        payroll_client.cancel_payroll_run(&admin, &run_id);
+        payroll_client.cancel_payroll_run(&admin, &run_id, &Symbol::new(&env, "cancelled"));
 
         let result = payroll_client.try_transition_payroll_run_state(
             &admin,
@@ -2959,7 +2963,7 @@ mod tests {
         );
 
         // Cancel the pending run
-        payroll_client.cancel_payroll_run(&admin, &run_id);
+        payroll_client.cancel_payroll_run(&admin, &run_id, &Symbol::new(&env, "cancelled"));
 
         // Verify it's no longer pending
         assert!(payroll_client.get_pending_run(&run_id).is_none());
@@ -3866,5 +3870,84 @@ mod tests {
             },
         }]);
         payroll_client.set_asset_allowed(&token_id, &false);
+    }
+
+    // ── Issue #332: Payroll cancellation escrow release & lifecycle tests ─────────
+
+    #[test]
+    fn test_cancellation_escrow_release_lifecycle() {
+        let env = Env::default();
+        let (payroll_client, admin, treasury, _treasury_owner, employee, token_id) =
+            setup_payroll_with_token(&env);
+
+        let token_client = TokenClient::new(&env, &token_id);
+        let initial_treasury = token_client.balance(&treasury);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 5_000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &5_000,
+            &test_nonce(&env, 232),
+            &None,
+        );
+
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Submitted
+        );
+        assert!(payroll_client.get_pending_run(&run_id).is_some());
+
+        // Cancel run and release escrowed/reserved reservation
+        let reason = Symbol::new(&env, "budget_adjusted");
+        payroll_client.cancel_payroll_run(&admin, &run_id, &reason);
+
+        // State must be Cancelled and pending record removed
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Cancelled
+        );
+        assert!(payroll_client.get_pending_run(&run_id).is_none());
+
+        // Treasury funds must remain fully intact (no accidental leak or spend)
+        assert_eq!(token_client.balance(&treasury), initial_treasury);
+        assert_eq!(token_client.balance(&employee), 0);
+
+        // Attempting to finalize a cancelled run must fail
+        let finalize_res = payroll_client.try_finalize_payroll_run(&admin, &run_id);
+        assert!(finalize_res.is_err());
+
+        // Attempting to re-cancel must fail (no double release)
+        let recancel_res = payroll_client.try_cancel_payroll_run(&admin, &run_id, &reason);
+        assert!(recancel_res.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot cancel a finalized payroll run")]
+    fn test_cannot_cancel_finalized_payroll_run() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1_000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1_000,
+            &test_nonce(&env, 233),
+            &None,
+        );
+
+        payroll_client.finalize_payroll_run(&admin, &run_id);
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Completed
+        );
+
+        // Cancellation of finalized run must be rejected
+        let reason = Symbol::new(&env, "attempt_cancel_after_final");
+        payroll_client.cancel_payroll_run(&admin, &run_id, &reason);
     }
 }

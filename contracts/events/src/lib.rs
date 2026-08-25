@@ -639,3 +639,39 @@ pub fn emit_audit_pause_manager_set(e: &Env, pause_manager: Address) {
     e.events()
         .publish((Symbol::new(e, "AuditPauseMgrSet"),), (pause_manager,));
 }
+
+/// Emitted when an employer-level payroll policy is set or updated (Issue #329).
+pub fn emit_payroll_policy_set(
+    e: &Env,
+    company_id: u64,
+    settlement_window: u64,
+    reserve_ratio_bps: u32,
+    approval_threshold: u32,
+    audit_retention_period: u64,
+    auto_settlement_enabled: bool,
+) {
+    e.events().publish(
+        (Symbol::new(e, "PayrollPolicySet"), company_id),
+        (
+            settlement_window,
+            reserve_ratio_bps,
+            approval_threshold,
+            audit_retention_period,
+            auto_settlement_enabled,
+        ),
+    );
+}
+
+/// Emitted when an emergency commitment rotation occurs (Issue #331).
+pub fn emit_emergency_commitment_rotated(
+    e: &Env,
+    employee: Address,
+    old_commitment: BytesN<32>,
+    new_commitment: BytesN<32>,
+    reason: Symbol,
+) {
+    e.events().publish(
+        (Symbol::new(e, "EmergencyWalletRotated"), employee),
+        (old_commitment, new_commitment, reason),
+    );
+}
