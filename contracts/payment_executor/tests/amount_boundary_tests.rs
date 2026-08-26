@@ -208,6 +208,7 @@ fn test_total_paid_overflow_panics_after_treasury_replenishment() {
     // Treasury is now drained to 0; replenishing it and paying again is a
     // legitimate flow that pushes the running total past `i128::MAX`.
     token.mint(&treasury, &100i128);
+    executor.close_period(&company_id, &1);
     executor.create_period(&company_id);
     executor.execute_payment(
         &company_id,
@@ -242,6 +243,7 @@ fn test_precision_preserved_across_multiple_non_round_payments() {
         token.mint(&treasury, &amount);
 
         if i > 0 {
+            executor.close_period(&company_id, &(i as u32));
             executor.create_period(&company_id);
         }
 

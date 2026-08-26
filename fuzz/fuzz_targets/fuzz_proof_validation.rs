@@ -1,16 +1,12 @@
 #![no_main]
 
-use libfuzzer_sys::fuzz_target;
 use arbitrary::Arbitrary;
+use libfuzzer_sys::fuzz_target;
 
-use soroban_sdk::{
-    Address, BytesN, Env, Vec, testutils::Address as _,
-};
-use payment_executor::{
-    ContractAddresses, PaymentExecutor, PaymentExecutorClient, PaymentError,
-};
+use payment_executor::{ContractAddresses, PaymentError, PaymentExecutor, PaymentExecutorClient};
 use payroll_registry::{PayrollRegistry, PayrollRegistryClient};
-use proof_verifier::{ProofVerifier, ProofVerifierClient, VerificationKey, Groth16Proof};
+use proof_verifier::{Groth16Proof, ProofVerifier, ProofVerifierClient, VerificationKey};
+use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, Vec};
 use token::{Token, TokenClient};
 
 #[derive(Arbitrary, Debug)]
@@ -280,7 +276,10 @@ fuzz_target!(|input: FuzzInput| {
                 // Invariant assertions on successful payment execution
                 assert!(test_amount >= 0);
                 assert_eq!(sys.token.balance(&employee), initial_employee + test_amount);
-                assert_eq!(sys.token.balance(&sys.treasury), initial_treasury - test_amount);
+                assert_eq!(
+                    sys.token.balance(&sys.treasury),
+                    initial_treasury - test_amount
+                );
                 assert!(sys.executor.is_paid(&employee, &test_period));
                 assert!(sys.executor.get_total_paid(&sys.company_id) >= test_amount);
 
@@ -295,7 +294,10 @@ fuzz_target!(|input: FuzzInput| {
                     &BytesN::from_array(&env, &nullifier),
                     &test_period,
                 );
-                assert_eq!(replay_res.unwrap_err().unwrap(), PaymentError::ProofAlreadyUsed);
+                assert_eq!(
+                    replay_res.unwrap_err().unwrap(),
+                    PaymentError::ProofAlreadyUsed
+                );
             } else {
                 // Transaction Atomicity Invariant: Check that no state / balance changed on failure
                 assert_eq!(sys.token.balance(&employee), initial_employee);
@@ -321,7 +323,8 @@ fuzz_target!(|input: FuzzInput| {
             let mut batch_size = if force_empty_batch {
                 0
             } else {
-                let mut sz = amounts.len()
+                let mut sz = amounts
+                    .len()
                     .min(proofs_a.len())
                     .min(proofs_b.len())
                     .min(proofs_c.len())
@@ -422,10 +425,16 @@ fuzz_target!(|input: FuzzInput| {
                     assert_eq!(records.len() as usize, batch_size);
                     let mut total_expected_deduction = 0;
                     for (i, emp) in test_employees.iter().enumerate() {
-                        assert_eq!(sys.token.balance(emp), initial_balances[i] + test_amounts[i]);
+                        assert_eq!(
+                            sys.token.balance(emp),
+                            initial_balances[i] + test_amounts[i]
+                        );
                         total_expected_deduction += test_amounts[i];
                     }
-                    assert_eq!(sys.token.balance(&sys.treasury), initial_treasury - total_expected_deduction);
+                    assert_eq!(
+                        sys.token.balance(&sys.treasury),
+                        initial_treasury - total_expected_deduction
+                    );
 
                     // Duplicate nullifier checks: if batch succeeded, then all nullifiers used must be registered
                     for (i, emp) in test_employees.iter().enumerate() {
@@ -439,7 +448,10 @@ fuzz_target!(|input: FuzzInput| {
                             &test_nullifiers[i],
                             &period,
                         );
-                        assert_eq!(replay_res.unwrap_err().unwrap(), PaymentError::ProofAlreadyUsed);
+                        assert_eq!(
+                            replay_res.unwrap_err().unwrap(),
+                            PaymentError::ProofAlreadyUsed
+                        );
                     }
                 }
                 _ => {
