@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 soroban-sdk = { workspace = true }
+payroll_events = { path = "../events" }
 proof_verifier = { path = "../proof_verifier" }
 salary_commitment = { path = "../salary_commitment" }
 token = { path = "../token" }

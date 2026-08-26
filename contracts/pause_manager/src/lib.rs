@@ -1,5 +1,6 @@
 #![no_std]
 
+#[allow(unused_imports)]
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 
 #[contracttype]
@@ -30,6 +31,7 @@ impl PauseManager {
         }
         e.storage().persistent().set(&DataKey::Operator, &operator);
         e.storage().persistent().set(&DataKey::Paused, &false);
+        payroll_events::emit_pause_manager_initialized(&e, operator);
     }
 
     pub fn pause(e: Env) {
@@ -40,10 +42,7 @@ impl PauseManager {
             .expect("Not initialized");
         operator.require_auth();
         e.storage().persistent().set(&DataKey::Paused, &true);
-        e.events().publish(
-            (Symbol::new(&e, "PauseManager"), Symbol::new(&e, "paused")),
-            (),
-        );
+        payroll_events::emit_paused(&e);
     }
 
     pub fn unpause(e: Env) {
@@ -54,10 +53,7 @@ impl PauseManager {
             .expect("Not initialized");
         operator.require_auth();
         e.storage().persistent().set(&DataKey::Paused, &false);
-        e.events().publish(
-            (Symbol::new(&e, "PauseManager"), Symbol::new(&e, "unpaused")),
-            (),
-        );
+        payroll_events::emit_unpaused(&e);
     }
 
     pub fn is_paused(e: Env) -> bool {
@@ -92,7 +88,10 @@ impl PauseManager {
             .set(&DataKey::PendingOperator, &proposal);
 
         e.events().publish(
-            (Symbol::new(&e, "PauseManager"), Symbol::new(&e, "op_proposed")),
+            (
+                Symbol::new(&e, "PauseManager"),
+                Symbol::new(&e, "op_proposed"),
+            ),
             (current_operator, new_operator),
         );
     }
@@ -112,12 +111,13 @@ impl PauseManager {
         e.storage()
             .persistent()
             .set(&DataKey::Operator, &new_operator);
-        e.storage()
-            .persistent()
-            .remove(&DataKey::PendingOperator);
+        e.storage().persistent().remove(&DataKey::PendingOperator);
 
         e.events().publish(
-            (Symbol::new(&e, "PauseManager"), Symbol::new(&e, "op_rotated")),
+            (
+                Symbol::new(&e, "PauseManager"),
+                Symbol::new(&e, "op_rotated"),
+            ),
             new_operator,
         );
     }
@@ -136,18 +136,26 @@ impl PauseManager {
         if !e.storage().persistent().has(&DataKey::PendingOperator) {
             panic!("No pending operator rotation to cancel");
         }
-        e.storage()
-            .persistent()
-            .remove(&DataKey::PendingOperator);
+        e.storage().persistent().remove(&DataKey::PendingOperator);
 
         e.events().publish(
-            (Symbol::new(&e, "PauseManager"), Symbol::new(&e, "op_cancelled")),
+            (
+                Symbol::new(&e, "PauseManager"),
+                Symbol::new(&e, "op_cancelled"),
+            ),
             current_operator,
         );
     }
 
     pub fn get_pending_operator_rotation(e: Env) -> Option<PendingOperatorRotation> {
         e.storage().persistent().get(&DataKey::PendingOperator)
+    }
+
+    pub fn get_operator(e: Env) -> Address {
+        e.storage()
+            .persistent()
+            .get(&DataKey::Operator)
+            .expect("Not initialized")
     }
 }
 
@@ -160,60 +168,103 @@ impl<'a> PauseManagerClient<'a> {
         Self(env, contract_id)
     }
 
+    fn empty_args(env: &Env) -> soroban_sdk::Vec<soroban_sdk::Val> {
+        soroban_sdk::Vec::new(env)
+    }
+
+    fn single_arg<A: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
+        env: &Env,
+        a: A,
+    ) -> soroban_sdk::Vec<soroban_sdk::Val> {
+        let mut v = soroban_sdk::Vec::new(env);
+        v.push_back(a.into_val(env));
+        v
+    }
+
+    fn two_args<
+        A: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+        B: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+    >(
+        env: &Env,
+        a: A,
+        b: B,
+    ) -> soroban_sdk::Vec<soroban_sdk::Val> {
+        let mut v = soroban_sdk::Vec::new(env);
+        v.push_back(a.into_val(env));
+        v.push_back(b.into_val(env));
+        v
+    }
+
     pub fn initialize(&self, operator: &Address) {
-        self.0.invoke_contract(
-            &self.1,
+        let _: () = self.0.invoke_contract(
+            self.1,
             &Symbol::new(self.0, "initialize"),
-            (operator.clone(),),
+            Self::single_arg(self.0, operator.clone()),
         );
     }
 
     pub fn pause(&self) {
-        self.0
-            .invoke_contract(&self.1, &Symbol::new(self.0, "pause"), ());
+        let _: () = self.0.invoke_contract(
+            self.1,
+            &Symbol::new(self.0, "pause"),
+            Self::empty_args(self.0),
+        );
     }
 
     pub fn unpause(&self) {
-        self.0
-            .invoke_contract(&self.1, &Symbol::new(self.0, "unpause"), ());
+        let _: () = self.0.invoke_contract(
+            self.1,
+            &Symbol::new(self.0, "unpause"),
+            Self::empty_args(self.0),
+        );
     }
 
     pub fn is_paused(&self) -> bool {
-        self.0
-            .invoke_contract(&self.1, &Symbol::new(self.0, "is_paused"), ())
+        self.0.invoke_contract(
+            self.1,
+            &Symbol::new(self.0, "is_paused"),
+            Self::empty_args(self.0),
+        )
     }
 
     pub fn propose_operator_rotation(&self, current_operator: &Address, new_operator: &Address) {
-        self.0.invoke_contract(
-            &self.1,
+        let _: () = self.0.invoke_contract(
+            self.1,
             &Symbol::new(self.0, "propose_operator_rotation"),
-            (current_operator.clone(), new_operator.clone()),
+            Self::two_args(self.0, current_operator.clone(), new_operator.clone()),
         );
     }
 
     pub fn accept_operator_rotation(&self, new_operator: &Address) {
-        self.0.invoke_contract(
-            &self.1,
+        let _: () = self.0.invoke_contract(
+            self.1,
             &Symbol::new(self.0, "accept_operator_rotation"),
-            (new_operator.clone(),),
+            Self::single_arg(self.0, new_operator.clone()),
         );
     }
 
     pub fn cancel_operator_rotation(&self, current_operator: &Address) {
-        self.0.invoke_contract(
-            &self.1,
+        let _: () = self.0.invoke_contract(
+            self.1,
             &Symbol::new(self.0, "cancel_operator_rotation"),
-            (current_operator.clone(),),
+            Self::single_arg(self.0, current_operator.clone()),
         );
     }
 
     pub fn get_pending_operator_rotation(&self) -> Option<PendingOperatorRotation> {
-        self.0
-            .invoke_contract(
-                &self.1,
-                &Symbol::new(self.0, "get_pending_operator_rotation"),
-                (),
-            )
+        self.0.invoke_contract(
+            self.1,
+            &Symbol::new(self.0, "get_pending_operator_rotation"),
+            Self::empty_args(self.0),
+        )
+    }
+
+    pub fn get_operator(&self) -> Address {
+        self.0.invoke_contract(
+            self.1,
+            &Symbol::new(self.0, "get_operator"),
+            Self::empty_args(self.0),
+        )
     }
 }
 

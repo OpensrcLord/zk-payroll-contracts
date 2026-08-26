@@ -1,6 +1,10 @@
 use super::*;
 use soroban_sdk::testutils::{Address as _, Events};
-use soroban_sdk::{Env, IntoVal, Symbol, TryIntoVal};
+use soroban_sdk::{Env, IntoVal, String, Symbol, TryIntoVal};
+
+const VALID_EMPLOYEE_WALLET: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+const BAD_CHECKSUM_EMPLOYEE_WALLET: &str =
+    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHA";
 
 fn setup() -> (Env, Address) {
     let env = Env::default();
@@ -80,6 +84,66 @@ fn test_add_employee_stores_commitment() {
             .expect("employee commitment should be stored")
     });
     assert_eq!(stored, commitment);
+}
+
+#[test]
+fn test_validate_employee_wallet_format_accepts_valid_account_strkey() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let wallet = String::from_str(&env, VALID_EMPLOYEE_WALLET);
+
+    assert!(client.validate_employee_wallet_format(&wallet));
+}
+
+#[test]
+fn test_validate_employee_wallet_format_rejects_invalid_wallets() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let short_wallet = String::from_str(&env, "GSHORT");
+    let bad_checksum_wallet = String::from_str(&env, BAD_CHECKSUM_EMPLOYEE_WALLET);
+    let contract_strkey = Address::generate(&env).to_string();
+
+    assert!(!client.validate_employee_wallet_format(&short_wallet));
+    assert!(!client.validate_employee_wallet_format(&bad_checksum_wallet));
+    assert!(!client.validate_employee_wallet_format(&contract_strkey));
+}
+
+#[test]
+fn test_add_employee_by_wallet_stores_commitment() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let wallet = String::from_str(&env, VALID_EMPLOYEE_WALLET);
+    let employee = Address::from_string(&wallet);
+    let commitment = BytesN::from_array(&env, &[1u8; 32]);
+
+    let company_id = client.register_company(&admin, &treasury);
+    client.add_employee_by_wallet(&company_id, &wallet, &commitment);
+
+    assert_eq!(client.get_commitment(&company_id, &employee), commitment);
+    assert_eq!(
+        client.get_employee_status(&company_id, &employee),
+        EmployeeStatus::Active,
+    );
+}
+
+#[test]
+fn test_add_employee_by_wallet_rejects_invalid_wallet_before_storage() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let bad_wallet = String::from_str(&env, BAD_CHECKSUM_EMPLOYEE_WALLET);
+    let commitment = BytesN::from_array(&env, &[1u8; 32]);
+
+    let company_id = client.register_company(&admin, &treasury);
+    let before = env.events().all().len();
+    let result = client.try_add_employee_by_wallet(&company_id, &bad_wallet, &commitment);
+    let after = env.events().all().len();
+
+    assert!(result.is_err());
+    assert_eq!(after, before);
 }
 
 #[test]
@@ -704,4 +768,246 @@ fn test_admin_cannot_accept_treasury_rotation_in_place_of_proposed_treasury() {
 
     client.propose_treasury_rotation(&company_id, &admin, &new_treasury);
     client.accept_treasury_rotation(&company_id, &admin);
+}
+
+#[test]
+fn test_propose_treasury_rotation_emits_event() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+    let new_treasury = Address::generate(&env);
+
+    let before = env.events().all().len();
+    client.propose_treasury_rotation(&company_id, &admin, &new_treasury);
+    let after = env.events().all().len();
+    assert_eq!(after, before + 1);
+
+    let event = env.events().all().get(after - 1).unwrap();
+    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    assert_eq!(sym0, Symbol::new(&env, "TreasuryRotationProposed"));
+    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    assert_eq!(comp_id, company_id);
+}
+
+#[test]
+fn test_accept_treasury_rotation_emits_event() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+    let new_treasury = Address::generate(&env);
+
+    client.propose_treasury_rotation(&company_id, &admin, &new_treasury);
+
+    let before = env.events().all().len();
+    client.accept_treasury_rotation(&company_id, &new_treasury);
+    let after = env.events().all().len();
+    assert_eq!(after, before + 1);
+
+    let event = env.events().all().get(after - 1).unwrap();
+    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    assert_eq!(sym0, Symbol::new(&env, "TreasuryRotated"));
+    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    assert_eq!(comp_id, company_id);
+
+    let company = client.get_company(&company_id);
+    assert_eq!(company.treasury, new_treasury);
+}
+
+#[test]
+fn test_cancel_treasury_rotation_emits_event() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+    let new_treasury = Address::generate(&env);
+
+    client.propose_treasury_rotation(&company_id, &admin, &new_treasury);
+
+    let before = env.events().all().len();
+    client.cancel_treasury_rotation(&company_id, &admin);
+    let after = env.events().all().len();
+    assert_eq!(after, before + 1);
+
+    let event = env.events().all().get(after - 1).unwrap();
+    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    assert_eq!(sym0, Symbol::new(&env, "TreasuryRotationCancelled"));
+    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    assert_eq!(comp_id, company_id);
+}
+
+// ── Issue #329: Employer-level payroll policy registry tests ─────────────────
+
+#[test]
+fn test_set_and_get_payroll_policy_success() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+
+    assert_eq!(client.get_payroll_policy(&company_id), None);
+
+    let policy = PayrollPolicy {
+        company_id,
+        settlement_window: 86400,
+        reserve_ratio_bps: 2000,
+        approval_threshold: 2,
+        audit_retention_period: 31536000,
+        auto_settlement_enabled: true,
+    };
+
+    client.set_payroll_policy(&company_id, &policy);
+    let fetched = client.get_payroll_policy(&company_id);
+    assert_eq!(fetched, Some(policy.clone()));
+
+    // Update policy
+    let updated_policy = PayrollPolicy {
+        company_id,
+        settlement_window: 172800,
+        reserve_ratio_bps: 1000,
+        approval_threshold: 1,
+        audit_retention_period: 15768000,
+        auto_settlement_enabled: false,
+    };
+    client.set_payroll_policy(&company_id, &updated_policy);
+    assert_eq!(client.get_payroll_policy(&company_id), Some(updated_policy));
+}
+
+#[test]
+fn test_set_payroll_policy_emits_event() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+
+    let policy = PayrollPolicy {
+        company_id,
+        settlement_window: 86400,
+        reserve_ratio_bps: 2000,
+        approval_threshold: 2,
+        audit_retention_period: 31536000,
+        auto_settlement_enabled: true,
+    };
+
+    let before = env.events().all().len();
+    client.set_payroll_policy(&company_id, &policy);
+    let after = env.events().all().len();
+    assert_eq!(after, before + 1);
+
+    let event = env.events().all().get(after - 1).unwrap();
+    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    assert_eq!(sym0, Symbol::new(&env, "PayrollPolicySet"));
+    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    assert_eq!(comp_id, company_id);
+}
+
+#[test]
+#[should_panic(expected = "Company ID in policy does not match target company")]
+fn test_set_payroll_policy_mismatched_company_id_panics() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+
+    let policy = PayrollPolicy {
+        company_id: company_id + 1, // mismatched
+        settlement_window: 86400,
+        reserve_ratio_bps: 2000,
+        approval_threshold: 2,
+        audit_retention_period: 31536000,
+        auto_settlement_enabled: true,
+    };
+
+    client.set_payroll_policy(&company_id, &policy);
+}
+
+#[test]
+#[should_panic(expected = "Settlement window must be greater than 0")]
+fn test_set_payroll_policy_invalid_settlement_window_panics() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+
+    let policy = PayrollPolicy {
+        company_id,
+        settlement_window: 0,
+        reserve_ratio_bps: 2000,
+        approval_threshold: 2,
+        audit_retention_period: 31536000,
+        auto_settlement_enabled: true,
+    };
+
+    client.set_payroll_policy(&company_id, &policy);
+}
+
+#[test]
+#[should_panic(expected = "Reserve ratio bps cannot exceed 10000")]
+fn test_set_payroll_policy_invalid_reserve_ratio_panics() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+
+    let policy = PayrollPolicy {
+        company_id,
+        settlement_window: 86400,
+        reserve_ratio_bps: 10_001,
+        approval_threshold: 2,
+        audit_retention_period: 31536000,
+        auto_settlement_enabled: true,
+    };
+
+    client.set_payroll_policy(&company_id, &policy);
+}
+
+#[test]
+#[should_panic(expected = "Approval threshold must be greater than 0")]
+fn test_set_payroll_policy_invalid_approval_threshold_panics() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+
+    let policy = PayrollPolicy {
+        company_id,
+        settlement_window: 86400,
+        reserve_ratio_bps: 2000,
+        approval_threshold: 0,
+        audit_retention_period: 31536000,
+        auto_settlement_enabled: true,
+    };
+
+    client.set_payroll_policy(&company_id, &policy);
+}
+
+#[test]
+#[should_panic(expected = "Audit retention period must be greater than 0")]
+fn test_set_payroll_policy_invalid_audit_retention_panics() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+
+    let policy = PayrollPolicy {
+        company_id,
+        settlement_window: 86400,
+        reserve_ratio_bps: 2000,
+        approval_threshold: 2,
+        audit_retention_period: 0,
+        auto_settlement_enabled: true,
+    };
+
+    client.set_payroll_policy(&company_id, &policy);
 }
