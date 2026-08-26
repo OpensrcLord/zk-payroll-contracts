@@ -120,6 +120,20 @@ pub struct AuditMetadataSummary {
     pub exported_by: Address,
 }
 
+// ── Issue #330: deterministic audit attestation digest builder ──────────────
+
+/// Attestation input structure for building deterministic audit digests (issue #330).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditAttestationInput {
+    pub employer: Address,
+    pub period_start: u64,
+    pub period_end: u64,
+    pub batch_root: BytesN<32>,
+    pub scope: AuditScope,
+    pub schema_version: u32,
+}
+
 /// Storage key namespace.
 #[contracttype]
 pub enum DataKey {
@@ -706,6 +720,38 @@ impl AuditModule {
         preimage.extend_from_array(&key_slice);
         let commitment_slice: [u8; 32] = commitment.into();
         preimage.extend_from_array(&commitment_slice);
+        env.crypto().sha256(&preimage).into()
+    }
+
+    // ── Issue #330: deterministic audit attestation digest builder ───────────
+
+    /// Build a deterministic audit attestation digest (issue #330).
+    ///
+    /// Cryptographically binds domain separator `b"zkpayroll_audit_v1"` with
+    /// the attestation metadata and batch root without exposing raw payroll data.
+    pub fn build_audit_digest(env: Env, input: AuditAttestationInput) -> BytesN<32> {
+        let mut preimage = Bytes::new(&env);
+
+        // Domain separation tag
+        preimage.extend_from_slice(b"zkpayroll_audit_v1");
+
+        // Employer address XDR
+        let addr_xdr = input.employer.to_xdr(&env);
+        preimage.append(&addr_xdr);
+
+        // Time range
+        preimage.extend_from_array(&input.period_start.to_le_bytes());
+        preimage.extend_from_array(&input.period_end.to_le_bytes());
+
+        // Batch root
+        let root_slice: [u8; 32] = (&input.batch_root).into();
+        preimage.extend_from_array(&root_slice);
+
+        // Scope discriminant & schema version
+        let scope_val = input.scope as u32;
+        preimage.extend_from_array(&scope_val.to_le_bytes());
+        preimage.extend_from_array(&input.schema_version.to_le_bytes());
+
         env.crypto().sha256(&preimage).into()
     }
 }

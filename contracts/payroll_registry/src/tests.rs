@@ -839,3 +839,175 @@ fn test_cancel_treasury_rotation_emits_event() {
     let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(comp_id, company_id);
 }
+
+// ── Issue #329: Employer-level payroll policy registry tests ─────────────────
+
+#[test]
+fn test_set_and_get_payroll_policy_success() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+
+    assert_eq!(client.get_payroll_policy(&company_id), None);
+
+    let policy = PayrollPolicy {
+        company_id,
+        settlement_window: 86400,
+        reserve_ratio_bps: 2000,
+        approval_threshold: 2,
+        audit_retention_period: 31536000,
+        auto_settlement_enabled: true,
+    };
+
+    client.set_payroll_policy(&company_id, &policy);
+    let fetched = client.get_payroll_policy(&company_id);
+    assert_eq!(fetched, Some(policy.clone()));
+
+    // Update policy
+    let updated_policy = PayrollPolicy {
+        company_id,
+        settlement_window: 172800,
+        reserve_ratio_bps: 1000,
+        approval_threshold: 1,
+        audit_retention_period: 15768000,
+        auto_settlement_enabled: false,
+    };
+    client.set_payroll_policy(&company_id, &updated_policy);
+    assert_eq!(client.get_payroll_policy(&company_id), Some(updated_policy));
+}
+
+#[test]
+fn test_set_payroll_policy_emits_event() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+
+    let policy = PayrollPolicy {
+        company_id,
+        settlement_window: 86400,
+        reserve_ratio_bps: 2000,
+        approval_threshold: 2,
+        audit_retention_period: 31536000,
+        auto_settlement_enabled: true,
+    };
+
+    let before = env.events().all().len();
+    client.set_payroll_policy(&company_id, &policy);
+    let after = env.events().all().len();
+    assert_eq!(after, before + 1);
+
+    let event = env.events().all().get(after - 1).unwrap();
+    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    assert_eq!(sym0, Symbol::new(&env, "PayrollPolicySet"));
+    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    assert_eq!(comp_id, company_id);
+}
+
+#[test]
+#[should_panic(expected = "Company ID in policy does not match target company")]
+fn test_set_payroll_policy_mismatched_company_id_panics() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+
+    let policy = PayrollPolicy {
+        company_id: company_id + 1, // mismatched
+        settlement_window: 86400,
+        reserve_ratio_bps: 2000,
+        approval_threshold: 2,
+        audit_retention_period: 31536000,
+        auto_settlement_enabled: true,
+    };
+
+    client.set_payroll_policy(&company_id, &policy);
+}
+
+#[test]
+#[should_panic(expected = "Settlement window must be greater than 0")]
+fn test_set_payroll_policy_invalid_settlement_window_panics() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+
+    let policy = PayrollPolicy {
+        company_id,
+        settlement_window: 0,
+        reserve_ratio_bps: 2000,
+        approval_threshold: 2,
+        audit_retention_period: 31536000,
+        auto_settlement_enabled: true,
+    };
+
+    client.set_payroll_policy(&company_id, &policy);
+}
+
+#[test]
+#[should_panic(expected = "Reserve ratio bps cannot exceed 10000")]
+fn test_set_payroll_policy_invalid_reserve_ratio_panics() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+
+    let policy = PayrollPolicy {
+        company_id,
+        settlement_window: 86400,
+        reserve_ratio_bps: 10_001,
+        approval_threshold: 2,
+        audit_retention_period: 31536000,
+        auto_settlement_enabled: true,
+    };
+
+    client.set_payroll_policy(&company_id, &policy);
+}
+
+#[test]
+#[should_panic(expected = "Approval threshold must be greater than 0")]
+fn test_set_payroll_policy_invalid_approval_threshold_panics() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+
+    let policy = PayrollPolicy {
+        company_id,
+        settlement_window: 86400,
+        reserve_ratio_bps: 2000,
+        approval_threshold: 0,
+        audit_retention_period: 31536000,
+        auto_settlement_enabled: true,
+    };
+
+    client.set_payroll_policy(&company_id, &policy);
+}
+
+#[test]
+#[should_panic(expected = "Audit retention period must be greater than 0")]
+fn test_set_payroll_policy_invalid_audit_retention_panics() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+
+    let policy = PayrollPolicy {
+        company_id,
+        settlement_window: 86400,
+        reserve_ratio_bps: 2000,
+        approval_threshold: 2,
+        audit_retention_period: 0,
+        auto_settlement_enabled: true,
+    };
+
+    client.set_payroll_policy(&company_id, &policy);
+}
