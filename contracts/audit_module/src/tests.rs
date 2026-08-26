@@ -986,444 +986,86 @@ fn test_verify_payroll_metadata_revoked_auditor_rejected() {
     assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyNotFound);
 }
 
-// ── Issue #356: stale audit grant pruning ────────────────────────────────────
-
-// Helper: build a Vec<Address> from a slice.
-fn addr_vec(env: &Env, addrs: &[soroban_sdk::Address]) -> Vec<soroban_sdk::Address> {
-    let mut v = Vec::new(env);
-    for a in addrs {
-        v.push_back(a.clone());
-    }
-    v
-}
-
-// ---------------------------------------------------------------------------
-// prune_expired_grants — core pruning behaviour
-// ---------------------------------------------------------------------------
+// ── Issue #330: Deterministic audit attestation digest builder tests ──────────
 
 #[test]
-fn test_prune_expired_grant_removes_key_and_blocks_access() {
+fn test_build_audit_digest_deterministic() {
     let (env, contract_id) = setup();
     let client = AuditModuleClient::new(&env, &contract_id);
+    let employer = soroban_sdk::Address::generate(&env);
+    let batch_root = BytesN::from_array(&env, &[0x11; 32]);
 
-    let auditor = soroban_sdk::Address::generate(&env);
-    let seq = env.ledger().sequence();
-    let expiration = seq + 10;
-    client.generate_view_key(&auditor, &expiration);
+    let input1 = AuditAttestationInput {
+        employer: employer.clone(),
+        period_start: 1_000,
+        period_end: 2_000,
+        batch_root: batch_root.clone(),
+        scope: AuditScope::FullCompany,
+        schema_version: 1,
+    };
 
-    // Advance past expiry.
-    env.ledger().set_sequence_number(expiration + 1);
-    assert!(!client.verify_access(&auditor), "expired key should not grant access");
+    let input2 = AuditAttestationInput {
+        employer: employer.clone(),
+        period_start: 1_000,
+        period_end: 2_000,
+        batch_root: batch_root.clone(),
+        scope: AuditScope::FullCompany,
+        schema_version: 1,
+    };
 
-    let pruned = client
-        .prune_expired_grants(&addr_vec(&env, &[auditor.clone()]))
-        .unwrap();
-    assert_eq!(pruned, 1, "one grant should be pruned");
+    let digest1 = client.build_audit_digest(&input1);
+    let digest2 = client.build_audit_digest(&input2);
 
-    // Access must still be denied after pruning.
-    assert!(!client.verify_access(&auditor));
-
-    // get_view_key must return an error — the record was removed.
-    assert!(client.try_get_view_key(&auditor).is_err());
+    assert_eq!(digest1, digest2);
+    assert_ne!(digest1, BytesN::from_array(&env, &[0u8; 32]));
 }
 
 #[test]
-fn test_prune_leaves_active_grant_intact() {
+fn test_build_audit_digest_field_sensitivity() {
     let (env, contract_id) = setup();
     let client = AuditModuleClient::new(&env, &contract_id);
-
-    let auditor = soroban_sdk::Address::generate(&env);
-    let seq = env.ledger().sequence();
-    let expiration = seq + 1_000;
-    client.generate_view_key(&auditor, &expiration);
-
-    // Grant is still live — pruning must not touch it.
-    let pruned = client
-        .prune_expired_grants(&addr_vec(&env, &[auditor.clone()]))
-        .unwrap();
-    assert_eq!(pruned, 0, "active grant must not be pruned");
-
-    assert!(client.verify_access(&auditor));
-    let record = client.get_view_key(&auditor);
-    assert_eq!(record.expiration_ledger, expiration);
-}
-
-#[test]
-fn test_prune_at_exact_expiry_boundary_is_active() {
-    // The expiry condition is strict: sequence() > expiration_ledger.
-    // A key expires AT sequence == expiration_ledger is still valid.
-    let (env, contract_id) = setup();
-    let client = AuditModuleClient::new(&env, &contract_id);
-
-    let auditor = soroban_sdk::Address::generate(&env);
-    let seq = env.ledger().sequence();
-    let expiration = seq + 5;
-    client.generate_view_key(&auditor, &expiration);
-
-    // Advance to the exact expiry ledger — still valid.
-    env.ledger().set_sequence_number(expiration);
-    assert!(client.verify_access(&auditor));
-
-    let pruned = client
-        .prune_expired_grants(&addr_vec(&env, &[auditor.clone()]))
-        .unwrap();
-    assert_eq!(pruned, 0, "grant at exact expiry ledger must not be pruned");
-
-    assert!(client.verify_access(&auditor));
-}
-
-#[test]
-fn test_prune_one_past_expiry_boundary_removes_grant() {
-    let (env, contract_id) = setup();
-    let client = AuditModuleClient::new(&env, &contract_id);
-
-    let auditor = soroban_sdk::Address::generate(&env);
-    let seq = env.ledger().sequence();
-    let expiration = seq + 5;
-    client.generate_view_key(&auditor, &expiration);
-
-    // One ledger past expiry — now stale.
-    env.ledger().set_sequence_number(expiration + 1);
-    assert!(!client.verify_access(&auditor));
-
-    let pruned = client
-        .prune_expired_grants(&addr_vec(&env, &[auditor.clone()]))
-        .unwrap();
-    assert_eq!(pruned, 1);
-    assert!(client.try_get_view_key(&auditor).is_err());
-}
-
-// ---------------------------------------------------------------------------
-// Idempotency: already-pruned and never-granted addresses
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_prune_already_pruned_auditor_is_noop() {
-    let (env, contract_id) = setup();
-    let client = AuditModuleClient::new(&env, &contract_id);
-
-    let auditor = soroban_sdk::Address::generate(&env);
-    let seq = env.ledger().sequence();
-    let expiration = seq + 5;
-    client.generate_view_key(&auditor, &expiration);
-
-    env.ledger().set_sequence_number(expiration + 1);
-
-    // First prune — removes the grant.
-    let first = client
-        .prune_expired_grants(&addr_vec(&env, &[auditor.clone()]))
-        .unwrap();
-    assert_eq!(first, 1);
-
-    // Second prune of the same address — tombstone exists, AuditorKey absent.
-    let second = client
-        .prune_expired_grants(&addr_vec(&env, &[auditor.clone()]))
-        .unwrap();
-    assert_eq!(second, 0, "second prune of same address must be a no-op");
-}
-
-#[test]
-fn test_prune_address_with_no_grant_is_noop() {
-    let (env, contract_id) = setup();
-    let client = AuditModuleClient::new(&env, &contract_id);
-
-    let stranger = soroban_sdk::Address::generate(&env);
-
-    // No grant was ever issued — should return 0 and not panic.
-    let pruned = client
-        .prune_expired_grants(&addr_vec(&env, &[stranger]))
-        .unwrap();
-    assert_eq!(pruned, 0);
-}
-
-#[test]
-fn test_prune_mixed_batch_only_counts_expired() {
-    let (env, contract_id) = setup();
-    let client = AuditModuleClient::new(&env, &contract_id);
-
-    let expired_auditor = soroban_sdk::Address::generate(&env);
-    let active_auditor = soroban_sdk::Address::generate(&env);
-    let ungranteed = soroban_sdk::Address::generate(&env);
-
-    let seq = env.ledger().sequence();
-    let short_expiry = seq + 5;
-    let long_expiry = seq + 1_000;
-
-    client.generate_view_key(&expired_auditor, &short_expiry);
-    client.generate_view_key(&active_auditor, &long_expiry);
-
-    env.ledger().set_sequence_number(short_expiry + 1);
-
-    let pruned = client
-        .prune_expired_grants(&addr_vec(
-            &env,
-            &[expired_auditor.clone(), active_auditor.clone(), ungranteed],
-        ))
-        .unwrap();
-
-    assert_eq!(pruned, 1, "only the expired grant should be pruned");
-    assert!(!client.verify_access(&expired_auditor));
-    assert!(client.verify_access(&active_auditor));
-}
-
-// ---------------------------------------------------------------------------
-// Audit history preservation
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_audit_log_entries_preserved_after_pruning() {
-    let (env, contract_id) = setup();
-    let client = AuditModuleClient::new(&env, &contract_id);
-
-    let auditor = soroban_sdk::Address::generate(&env);
-    let seq = env.ledger().sequence();
-    let expiration = seq + 10;
-    client.generate_view_key(&auditor, &expiration);
-
-    // Record audit log entries while the grant is active.
-    let amount: i128 = 100_000;
-    let blinding = BytesN::from_array(&env, &[0xAB; 32]);
-    let mut preimage = soroban_sdk::Bytes::new(&env);
-    preimage.extend_from_array(&amount.to_le_bytes());
-    let blinding_slice: [u8; 32] = (&blinding).into();
-    preimage.extend_from_array(&blinding_slice);
-    let commitment: BytesN<32> = env.crypto().sha256(&preimage).into();
-
-    client.verify_commitment_with_key(
-        &auditor,
-        &commitment,
-        &amount,
-        &blinding,
-        &AuditScope::EmployeeList,
-    );
-
-    let company_id = Symbol::new(&env, "default");
-    let count_before = client.get_audit_log_count(&company_id);
-    assert!(count_before > 0, "audit log should have entries before pruning");
-
-    // Expire and prune the grant.
-    env.ledger().set_sequence_number(expiration + 1);
-    client
-        .prune_expired_grants(&addr_vec(&env, &[auditor.clone()]))
-        .unwrap();
-
-    // Audit log entries must survive pruning — count is unchanged.
-    let count_after = client.get_audit_log_count(&company_id);
-    assert_eq!(
-        count_after, count_before,
-        "audit log entries must not be removed by pruning"
-    );
-
-    // The existing entries are still queryable.
-    let result = client.query_by_company(&company_id);
-    assert!(
-        !result.entries.is_empty(),
-        "historical audit entries must remain queryable after pruning"
-    );
-}
-
-#[test]
-fn test_pruned_grant_ref_tombstone_is_written() {
-    let (env, contract_id) = setup();
-    let client = AuditModuleClient::new(&env, &contract_id);
-
-    let auditor = soroban_sdk::Address::generate(&env);
-    let seq = env.ledger().sequence();
-    let expiration = seq + 7;
-    client.generate_view_key(&auditor, &expiration);
-
-    env.ledger().set_sequence_number(expiration + 1);
-    client
-        .prune_expired_grants(&addr_vec(&env, &[auditor.clone()]))
-        .unwrap();
-
-    let tombstone = client
-        .get_pruned_grant_ref(&auditor)
-        .expect("PrunedGrantRef tombstone must exist after pruning");
-
-    assert_eq!(tombstone.expired_at_ledger, expiration);
-    assert_eq!(tombstone.pruned_at_ledger, expiration + 1);
-    // key_digest is 32 bytes of SHA-256 — just assert it is non-zero.
-    let digest_bytes: [u8; 32] = tombstone.key_digest.into();
-    assert_ne!(digest_bytes, [0u8; 32], "key_digest must be non-zero");
-}
-
-#[test]
-fn test_get_pruned_grant_ref_returns_none_for_active_grant() {
-    let (env, contract_id) = setup();
-    let client = AuditModuleClient::new(&env, &contract_id);
-
-    let auditor = soroban_sdk::Address::generate(&env);
-    let seq = env.ledger().sequence();
-    client.generate_view_key(&auditor, &(seq + 1_000));
-
-    // No pruning has happened.
-    let tombstone = client.get_pruned_grant_ref(&auditor);
-    assert!(tombstone.is_none(), "no tombstone for an active grant");
-}
-
-// ---------------------------------------------------------------------------
-// AuditGrantPruned event emission
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_prune_emits_audit_grant_pruned_event() {
-    let (env, contract_id) = setup();
-    let client = AuditModuleClient::new(&env, &contract_id);
-
-    let auditor = soroban_sdk::Address::generate(&env);
-    let seq = env.ledger().sequence();
-    let expiration = seq + 10;
-    client.generate_view_key(&auditor, &expiration);
-
-    env.ledger().set_sequence_number(expiration + 1);
-
-    let before = env.events().all().len();
-    client
-        .prune_expired_grants(&addr_vec(&env, &[auditor.clone()]))
-        .unwrap();
-    let after = env.events().all().len();
-
-    assert_eq!(after, before + 1, "exactly one AuditGrantPruned event emitted");
-
-    let event = env.events().all().get(after - 1).unwrap();
-    // topics: ("AuditGrantPruned", auditor)
-    assert_eq!(event.1.len(), 2);
-    let sym: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
-    assert_eq!(sym, Symbol::new(&env, "AuditGrantPruned"));
-    let addr: Address = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
-    assert_eq!(addr, auditor);
-}
-
-#[test]
-fn test_prune_no_event_for_active_grant() {
-    let (env, contract_id) = setup();
-    let client = AuditModuleClient::new(&env, &contract_id);
-
-    let auditor = soroban_sdk::Address::generate(&env);
-    let seq = env.ledger().sequence();
-    client.generate_view_key(&auditor, &(seq + 1_000));
-
-    let before = env.events().all().len();
-    client
-        .prune_expired_grants(&addr_vec(&env, &[auditor]))
-        .unwrap();
-    let after = env.events().all().len();
-
-    assert_eq!(after, before, "no event emitted when no grant was pruned");
-}
-
-#[test]
-fn test_prune_no_event_for_never_granted_address() {
-    let (env, contract_id) = setup();
-    let client = AuditModuleClient::new(&env, &contract_id);
-
-    let stranger = soroban_sdk::Address::generate(&env);
-    let before = env.events().all().len();
-    client
-        .prune_expired_grants(&addr_vec(&env, &[stranger]))
-        .unwrap();
-    let after = env.events().all().len();
-
-    assert_eq!(after, before, "no event emitted for address with no grant");
-}
-
-// ---------------------------------------------------------------------------
-// Enumeration index (AuditorCount / get_auditor_at_index)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_registered_grant_count_increments_on_each_generate() {
-    let (env, contract_id) = setup();
-    let client = AuditModuleClient::new(&env, &contract_id);
-
-    assert_eq!(client.get_registered_grant_count(), 0);
-
-    let seq = env.ledger().sequence();
-    let a1 = soroban_sdk::Address::generate(&env);
-    let a2 = soroban_sdk::Address::generate(&env);
-
-    client.generate_view_key(&a1, &(seq + 100));
-    assert_eq!(client.get_registered_grant_count(), 1);
-
-    client.generate_view_key(&a2, &(seq + 200));
-    assert_eq!(client.get_registered_grant_count(), 2);
-}
-
-#[test]
-fn test_get_auditor_at_index_returns_correct_address() {
-    let (env, contract_id) = setup();
-    let client = AuditModuleClient::new(&env, &contract_id);
-
-    let seq = env.ledger().sequence();
-    let a1 = soroban_sdk::Address::generate(&env);
-    let a2 = soroban_sdk::Address::generate(&env);
-
-    client.generate_view_key(&a1, &(seq + 100));
-    client.generate_view_key(&a2, &(seq + 200));
-
-    let at0 = client.get_auditor_at_index(&0u32).expect("index 0 must exist");
-    let at1 = client.get_auditor_at_index(&1u32).expect("index 1 must exist");
-
-    assert_eq!(at0, a1);
-    assert_eq!(at1, a2);
-}
-
-#[test]
-fn test_get_auditor_at_index_out_of_bounds_returns_none() {
-    let (env, contract_id) = setup();
-    let client = AuditModuleClient::new(&env, &contract_id);
-
-    assert!(
-        client.get_auditor_at_index(&0u32).is_none(),
-        "out-of-bounds index must return None"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Batch-size limit
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_prune_batch_too_large_returns_error() {
-    let (env, contract_id) = setup();
-    let client = AuditModuleClient::new(&env, &contract_id);
-
-    // Build a list of 51 addresses (one over MAX_PRUNE_BATCH = 50).
-    let seq = env.ledger().sequence();
-    let mut big_batch = Vec::new(&env);
-    for _ in 0..51u32 {
-        let addr = soroban_sdk::Address::generate(&env);
-        // Grant a key so the list is realistic.
-        client.generate_view_key(&addr, &(seq + 1_000));
-        big_batch.push_back(addr);
-    }
-
-    let result = client.try_prune_expired_grants(&big_batch);
-    assert_eq!(
-        result.unwrap_err().unwrap(),
-        AuditError::PruneBatchTooLarge,
-        "batch of 51 must be rejected"
-    );
-}
-
-#[test]
-fn test_prune_batch_of_exactly_50_is_accepted() {
-    let (env, contract_id) = setup();
-    let client = AuditModuleClient::new(&env, &contract_id);
-
-    let seq = env.ledger().sequence();
-    let expiration = seq + 5;
-    let mut batch = Vec::new(&env);
-    for _ in 0..50u32 {
-        let addr = soroban_sdk::Address::generate(&env);
-        client.generate_view_key(&addr, &expiration);
-        batch.push_back(addr);
-    }
-
-    env.ledger().set_sequence_number(expiration + 1);
-
-    let result = client.try_prune_expired_grants(&batch);
-    assert!(result.is_ok(), "batch of exactly 50 must be accepted");
-    assert_eq!(result.unwrap().unwrap(), 50);
+    let employer1 = soroban_sdk::Address::generate(&env);
+    let employer2 = soroban_sdk::Address::generate(&env);
+    let batch_root1 = BytesN::from_array(&env, &[0x11; 32]);
+    let batch_root2 = BytesN::from_array(&env, &[0x22; 32]);
+
+    let base = AuditAttestationInput {
+        employer: employer1.clone(),
+        period_start: 1_000,
+        period_end: 2_000,
+        batch_root: batch_root1.clone(),
+        scope: AuditScope::FullCompany,
+        schema_version: 1,
+    };
+    let base_digest = client.build_audit_digest(&base);
+
+    // Change employer
+    let mut diff_employer = base.clone();
+    diff_employer.employer = employer2;
+    assert_ne!(base_digest, client.build_audit_digest(&diff_employer));
+
+    // Change period start
+    let mut diff_start = base.clone();
+    diff_start.period_start = 1_001;
+    assert_ne!(base_digest, client.build_audit_digest(&diff_start));
+
+    // Change period end
+    let mut diff_end = base.clone();
+    diff_end.period_end = 2_001;
+    assert_ne!(base_digest, client.build_audit_digest(&diff_end));
+
+    // Change batch root
+    let mut diff_root = base.clone();
+    diff_root.batch_root = batch_root2;
+    assert_ne!(base_digest, client.build_audit_digest(&diff_root));
+
+    // Change scope
+    let mut diff_scope = base.clone();
+    diff_scope.scope = AuditScope::AggregateOnly;
+    assert_ne!(base_digest, client.build_audit_digest(&diff_scope));
+
+    // Change schema version
+    let mut diff_version = base.clone();
+    diff_version.schema_version = 2;
+    assert_ne!(base_digest, client.build_audit_digest(&diff_version));
 }

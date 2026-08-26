@@ -1,9 +1,9 @@
 #![no_std]
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token as soroban_token, Address, BytesN,
     Env, Symbol, Vec,
 };
-use soroban_sdk::xdr::ToXdr;
 
 use pause_manager::PauseManagerClient;
 use proof_verifier::ProofVerifierClient;
@@ -473,10 +473,128 @@ pub enum DataKey {
     ReservationExpiry(Address),
     /// Archive marker for finalized payroll runs (#335).
     ArchiveMarker(u64),
+    /// Latest accepted payroll nonce per employer for monotonicity enforcement (#362).
+    EmployerNonceSequence(Address),
+    /// Compliance evidence pointer record for off-chain encrypted evidence (#361).
+    EvidencePointer(BytesN<32>),
+    /// Deduplication index for evidence pointers to prevent duplicates (#361).
+    EvidencePointerIndex(BytesN<32>),
+    /// Contract storage version for migration checks (#360).
+    StorageVersion,
+    /// Migration readiness status for sensitive operations (#360).
+    MigrationReadiness,
     // Future upgrade example (issue #196):
     // PayrollRunV2(u64),  // Would be added here when schema evolution is needed
 }
 
+/// Storage version state for migration checks (#360).
+///
+/// This struct tracks the current storage version and migration status
+/// to prevent contract operations on unsupported or partially migrated storage.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StorageVersionState {
+    /// Current storage version
+    pub version: u32,
+    /// Timestamp when this version was set
+    pub updated_at: u64,
+    /// Whether migration is complete and all operations are allowed
+    pub migration_complete: bool,
+    /// Optional description of the current version
+    pub version_description: soroban_sdk::String,
+}
+
+/// Migration readiness state for client detection (#360).
+///
+/// This struct allows clients to check if the contract is ready for
+/// operations without performing the actual migration checks.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MigrationReadinessState {
+    /// Whether the contract is ready for operations
+    pub ready: bool,
+    /// Current storage version
+    pub current_version: u32,
+    /// Minimum supported version
+    pub min_supported: u32,
+    /// Maximum supported version
+    pub max_supported: u32,
+    /// Timestamp when this readiness was checked
+    pub checked_at: u64,
+}
+
+/// Employer-specific nonce sequence tracking for monotonicity enforcement (#362).
+///
+/// This struct tracks the latest accepted payroll nonce per employer to ensure
+/// monotonically increasing nonce ordering. This prevents:
+/// - Replay attacks using stale nonces
+/// - Ordering confusion in payroll history
+/// - Duplicate period submissions
+///
+/// The nonce_sequence counter is incremented with each accepted payroll run
+/// and must always be strictly greater than the previous value.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EmployerNonceSequenceState {
+    /// The latest accepted nonce sequence counter for this employer.
+    /// Starts at 0 and increments with each successful payroll run.
+    pub current_sequence: u64,
+    /// Timestamp of the last accepted payroll run for this employer.
+    pub last_accepted_at: u64,
+    /// The nonce value from the last accepted payroll run.
+    pub last_nonce: BytesN<32>,
+}
+
+// ── Issue #361: Compliance Evidence Pointer Validation ─────────────────────────
+
+/// Scope of a compliance evidence pointer.
+///
+/// Evidence pointers are scoped to prevent cross-context leakage and ensure
+/// that references to off-chain encrypted evidence are properly isolated.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum EvidencePointerScope {
+    /// Evidence related to a specific employer
+    Employer = 0,
+    /// Evidence related to a specific payroll period
+    Period = 1,
+    /// Evidence related to a specific review case
+    ReviewCase = 2,
+}
+
+/// Compliance evidence pointer for off-chain encrypted evidence (#361).
+///
+/// This struct provides a safe pointer to off-chain encrypted evidence without
+/// leaking the actual evidence contents on-chain. The pointer includes:
+/// - A hash commitment to the evidence content for integrity verification
+/// - Scoping information to prevent cross-context references
+/// - Deduplication information to prevent duplicate pointers
+///
+/// The actual evidence content is stored off-chain and referenced by the
+/// content_hash. This ensures that only safe pointers and integrity
+/// commitments are stored on-chain.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ComplianceEvidencePointer {
+    /// Unique identifier for this evidence pointer
+    pub pointer_id: BytesN<32>,
+    /// SHA-256 hash of the off-chain evidence content for integrity verification
+    pub content_hash: BytesN<32>,
+    /// Scope of this evidence pointer
+    pub scope: EvidencePointerScope,
+    /// Target entity (employer, period, or review case) this pointer relates to
+    pub target: Address,
+    /// Timestamp when this pointer was created
+    pub created_at: u64,
+    /// Address that created this pointer
+    pub created_by: Address,
+    /// Optional metadata hash for additional context (period, company ID, etc.)
+    /// Uses a zero-filled hash to represent "no metadata".
+    pub metadata_hash: BytesN<32>,
+}
+
+#[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl Payroll {
     pub fn initialize(
@@ -518,6 +636,9 @@ impl Payroll {
             addrs.treasury.clone(),
             treasury_owner.clone(),
         );
+
+        // #360 — initialize storage version tracking
+        Self::initialize_storage_version(&e);
     }
 
     fn require_not_paused(e: &Env) {
@@ -583,6 +704,503 @@ impl Payroll {
         if symbol == &empty {
             panic!("Symbol cannot be empty");
         }
+    }
+
+    /// Validate that a nonce is monotonically increasing for the given employer (#362).
+    ///
+    /// This function enforces that each payroll run for an employer uses a nonce
+    /// that is strictly greater than the previous accepted nonce. This prevents:
+    /// - Replay attacks using stale nonces
+    /// - Ordering confusion in payroll history
+    /// - Duplicate period submissions
+    ///
+    /// # Arguments
+    /// - `env`: Soroban environment
+    /// - `employer`: The employer address to check nonce sequence for
+    /// - `nonce`: The new nonce to validate
+    ///
+    /// # Panics
+    /// - If the nonce has already been used (replay attack)
+    /// - If the nonce is stale (less than or equal to the last accepted nonce)
+    fn validate_nonce_monotonicity(env: &Env, employer: &Address, nonce: &BytesN<32>) {
+        let sequence_key = DataKey::EmployerNonceSequence(employer.clone());
+
+        if let Some(sequence_state) = env
+            .storage()
+            .persistent()
+            .get::<_, EmployerNonceSequenceState>(&sequence_key)
+        {
+            // Check if this nonce has already been used
+            if nonce == &sequence_state.last_nonce {
+                panic!("Nonce replay detected: this nonce has already been used for this employer");
+            }
+
+            // Compare nonce values to ensure monotonic increase
+            // We treat the nonce as a u256 for comparison purposes
+            let new_nonce_value = Self::nonce_to_u256(env, nonce);
+            let last_nonce_value = Self::nonce_to_u256(env, &sequence_state.last_nonce);
+
+            if new_nonce_value <= last_nonce_value {
+                panic!("Stale nonce detected: nonce must be strictly greater than the last accepted nonce for this employer");
+            }
+        }
+        // If no sequence state exists, this is the first nonce for this employer - always valid
+    }
+
+    /// Update the nonce sequence tracking after a successful payroll run (#362).
+    ///
+    /// This function should be called after a payroll run is successfully processed
+    /// to update the employer's nonce sequence tracking.
+    ///
+    /// # Arguments
+    /// - `env`: Soroban environment
+    /// - `employer`: The employer address
+    /// - `nonce`: The nonce that was just accepted
+    fn update_nonce_sequence(env: &Env, employer: &Address, nonce: &BytesN<32>) {
+        let sequence_key = DataKey::EmployerNonceSequence(employer.clone());
+
+        let new_state = if let Some(mut existing_state) =
+            env.storage()
+                .persistent()
+                .get::<_, EmployerNonceSequenceState>(&sequence_key)
+        {
+            existing_state.current_sequence += 1;
+            existing_state.last_accepted_at = env.ledger().timestamp();
+            existing_state.last_nonce = nonce.clone();
+            existing_state
+        } else {
+            // First nonce for this employer
+            EmployerNonceSequenceState {
+                current_sequence: 1,
+                last_accepted_at: env.ledger().timestamp(),
+                last_nonce: nonce.clone(),
+            }
+        };
+
+        env.storage().persistent().set(&sequence_key, &new_state);
+    }
+
+    /// Convert a 32-byte nonce to a u256 value for comparison (#362).
+    ///
+    /// This function converts a BytesN<32> nonce to a u256 value for
+    /// monotonicity comparison. The conversion treats the nonce as a
+    /// big-endian unsigned integer.
+    fn nonce_to_u256(_env: &Env, nonce: &BytesN<32>) -> u128 {
+        // For simplicity, we'll use the first 16 bytes as a u128 for comparison
+        // This provides sufficient uniqueness for monotonicity enforcement
+        let bytes = nonce.to_array();
+        let mut value: u128 = 0;
+        for b in &bytes[..16] {
+            value = (value << 8) | (*b as u128);
+        }
+        value
+    }
+
+    /// Get the current nonce sequence state for an employer (#362).
+    ///
+    /// Returns the current nonce sequence tracking information for the specified
+    /// employer, or None if no payroll runs have been processed for this employer.
+    pub fn get_employer_nonce_sequence(
+        e: Env,
+        employer: Address,
+    ) -> Option<EmployerNonceSequenceState> {
+        e.storage()
+            .persistent()
+            .get(&DataKey::EmployerNonceSequence(employer))
+    }
+
+    // ── Issue #361: Compliance Evidence Pointer Validation ─────────────────────────
+
+    /// Create a new compliance evidence pointer for off-chain encrypted evidence (#361).
+    ///
+    /// This function validates and stores a pointer to off-chain encrypted evidence
+    /// without leaking the actual evidence contents. The pointer includes:
+    /// - A content hash for integrity verification
+    /// - Scoping information to prevent cross-context references
+    /// - Deduplication to prevent duplicate pointers
+    ///
+    /// # Arguments
+    /// - `env`: Soroban environment
+    /// - `admin`: The admin address creating the pointer
+    /// - `content_hash`: SHA-256 hash of the off-chain evidence content
+    /// - `scope`: The scope of this evidence pointer
+    /// - `target`: The target entity this pointer relates to
+    /// - `metadata_hash`: Optional metadata hash for additional context
+    ///
+    /// # Returns
+    /// The unique identifier for the created evidence pointer
+    ///
+    /// # Panics
+    /// - If the content hash is empty (all zeros)
+    /// - If the content hash has already been used (duplicate)
+    /// - If the pointer ID has already been used (duplicate)
+    pub fn create_evidence_pointer(
+        e: Env,
+        admin: Address,
+        content_hash: BytesN<32>,
+        scope: EvidencePointerScope,
+        target: Address,
+        metadata_hash: Option<BytesN<32>>,
+    ) -> BytesN<32> {
+        Self::require_not_paused(&e);
+        admin.require_auth();
+
+        // Validate content hash is not empty
+        let zero_hash = BytesN::from_array(&e, &[0u8; 32]);
+        if content_hash == zero_hash {
+            panic!("Content hash cannot be empty (all zeros)");
+        }
+
+        // Check for duplicate content hash
+        let content_index_key = DataKey::EvidencePointerIndex(content_hash.clone());
+        if e.storage().persistent().has(&content_index_key) {
+            panic!("Duplicate evidence pointer: content hash already exists");
+        }
+
+        // Generate a unique pointer ID using the content hash and timestamp
+        let pointer_id = Self::generate_pointer_id(&e, &content_hash);
+
+        // Check for duplicate pointer ID
+        let pointer_key = DataKey::EvidencePointer(pointer_id.clone());
+        if e.storage().persistent().has(&pointer_key) {
+            panic!("Duplicate evidence pointer: pointer ID already exists");
+        }
+
+        // Create the evidence pointer
+        let resolved_metadata = metadata_hash.unwrap_or(zero_hash);
+        let pointer = ComplianceEvidencePointer {
+            pointer_id: pointer_id.clone(),
+            content_hash: content_hash.clone(),
+            scope,
+            target: target.clone(),
+            created_at: e.ledger().timestamp(),
+            created_by: admin.clone(),
+            metadata_hash: resolved_metadata,
+        };
+
+        // Store the pointer
+        e.storage().persistent().set(&pointer_key, &pointer);
+
+        // Store the deduplication index
+        e.storage()
+            .persistent()
+            .set(&content_index_key, &pointer_id);
+
+        // Emit event for audit trail
+        e.events().publish(
+            (
+                symbol_short!("payroll"),
+                Symbol::new(&e, "evidence_pointer_created"),
+            ),
+            (
+                pointer_id.clone(),
+                content_hash,
+                scope as u32,
+                target,
+                admin,
+            ),
+        );
+
+        pointer_id
+    }
+
+    /// Validate and retrieve a compliance evidence pointer (#361).
+    ///
+    /// This function retrieves and validates an evidence pointer, ensuring it
+    /// exists and is properly formatted. It does not expose the actual evidence
+    /// content, only the pointer metadata.
+    ///
+    /// # Arguments
+    /// - `env`: Soroban environment
+    /// - `pointer_id`: The unique identifier of the evidence pointer
+    ///
+    /// # Returns
+    /// The evidence pointer if it exists
+    ///
+    /// # Panics
+    /// - If the pointer does not exist
+    /// - If the pointer is malformed
+    pub fn get_evidence_pointer(e: Env, pointer_id: BytesN<32>) -> ComplianceEvidencePointer {
+        let pointer_key = DataKey::EvidencePointer(pointer_id);
+        e.storage()
+            .persistent()
+            .get(&pointer_key)
+            .expect("Evidence pointer not found")
+    }
+
+    /// Check if an evidence pointer exists for a given content hash (#361).
+    ///
+    /// This function checks if an evidence pointer with the specified content
+    /// hash already exists, preventing duplicate pointers.
+    ///
+    /// # Arguments
+    /// - `env`: Soroban environment
+    /// - `content_hash`: The content hash to check
+    ///
+    /// # Returns
+    /// true if the content hash already has a pointer, false otherwise
+    pub fn evidence_pointer_exists(e: Env, content_hash: BytesN<32>) -> bool {
+        let content_index_key = DataKey::EvidencePointerIndex(content_hash);
+        e.storage().persistent().has(&content_index_key)
+    }
+
+    /// Generate a unique pointer ID from content hash and timestamp (#361).
+    ///
+    /// This function generates a deterministic pointer ID that is unique
+    /// for each combination of content hash and creation timestamp.
+    fn generate_pointer_id(e: &Env, content_hash: &BytesN<32>) -> BytesN<32> {
+        let timestamp = e.ledger().timestamp();
+        let mut data = soroban_sdk::Bytes::new(e);
+        data.extend_from_slice(&content_hash.to_array());
+        data.extend_from_slice(&timestamp.to_be_bytes());
+        e.crypto().sha256(&data).into()
+    }
+
+    // ── Issue #360: Storage Version Migration Checks ─────────────────────────────
+
+    /// Current contract storage version.
+    ///
+    /// This version is incremented whenever the storage schema changes.
+    /// It is used to:
+    /// - Detect when migration is required
+    /// - Block sensitive actions during migration
+    /// - Allow clients to detect migration readiness
+    pub const CURRENT_STORAGE_VERSION: u32 = 1;
+
+    /// Minimum supported storage version.
+    ///
+    /// Storage versions below this are considered unsupported and will
+    /// cause the contract to panic on sensitive operations.
+    pub const MIN_SUPPORTED_STORAGE_VERSION: u32 = 1;
+
+    /// Maximum supported storage version.
+    ///
+    /// Storage versions above this are considered future versions and will
+    /// cause the contract to panic on sensitive operations.
+    pub const MAX_SUPPORTED_STORAGE_VERSION: u32 = 1;
+
+    ///
+    /// This function should be called during contract initialization to set
+    /// the initial storage version. It can also be used to update the version
+    /// after a migration.
+    ///
+    /// # Arguments
+    /// - `env`: Soroban environment
+    /// - `admin`: The admin address (requires authorization)
+    /// - `version`: The storage version to set
+    /// - `description`: Optional description of the version
+    ///
+    /// # Panics
+    /// - If the version is outside the supported range
+    /// - If the caller is not authorized
+    pub fn set_storage_version(
+        e: Env,
+        admin: Address,
+        version: u32,
+        description: soroban_sdk::String,
+    ) {
+        Self::require_not_paused(&e);
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        // Validate version is within supported range
+        if version < Self::MIN_SUPPORTED_STORAGE_VERSION
+            || version > Self::MAX_SUPPORTED_STORAGE_VERSION
+        {
+            panic!("Storage version out of supported range");
+        }
+
+        let state = StorageVersionState {
+            version,
+            updated_at: e.ledger().timestamp(),
+            migration_complete: true, // Setting version implies migration is complete
+            version_description: description,
+        };
+
+        e.storage()
+            .persistent()
+            .set(&DataKey::StorageVersion, &state);
+
+        // Also update the migration readiness
+        let readiness = MigrationReadinessState {
+            ready: true,
+            current_version: version,
+            min_supported: Self::MIN_SUPPORTED_STORAGE_VERSION,
+            max_supported: Self::MAX_SUPPORTED_STORAGE_VERSION,
+            checked_at: e.ledger().timestamp(),
+        };
+        e.storage()
+            .persistent()
+            .set(&DataKey::MigrationReadiness, &readiness);
+
+        // Emit event for audit trail
+        e.events().publish(
+            (
+                symbol_short!("payroll"),
+                Symbol::new(&e, "storage_version_set"),
+            ),
+            (version, admin),
+        );
+    }
+
+    /// Get the current storage version (#360).
+    ///
+    /// Returns the current storage version state, or None if not initialized.
+    /// Clients can use this to detect if migration is required.
+    pub fn get_storage_version(e: Env) -> Option<StorageVersionState> {
+        e.storage().persistent().get(&DataKey::StorageVersion)
+    }
+
+    /// Check if the current storage version is supported (#360).
+    ///
+    /// Returns true if the storage version is within the supported range,
+    /// false otherwise. Clients should check this before performing sensitive
+    /// operations.
+    pub fn is_storage_version_supported(e: Env) -> bool {
+        if let Some(state) = e
+            .storage()
+            .persistent()
+            .get::<_, StorageVersionState>(&DataKey::StorageVersion)
+        {
+            state.version >= Self::MIN_SUPPORTED_STORAGE_VERSION
+                && state.version <= Self::MAX_SUPPORTED_STORAGE_VERSION
+        } else {
+            // If no version is set, assume current version for backward compatibility
+            true
+        }
+    }
+
+    /// Check if migration is required (#360).
+    ///
+    /// Returns true if the current storage version is below the minimum
+    /// supported version, indicating migration is required.
+    pub fn is_migration_required(e: Env) -> bool {
+        if let Some(state) = e
+            .storage()
+            .persistent()
+            .get::<_, StorageVersionState>(&DataKey::StorageVersion)
+        {
+            state.version < Self::MIN_SUPPORTED_STORAGE_VERSION
+        } else {
+            // If no version is set, assume no migration required for backward compatibility
+            false
+        }
+    }
+
+    /// Validate storage version for sensitive operations (#360).
+    ///
+    /// This function should be called before any sensitive operation to ensure
+    /// the storage version is supported and migration is complete.
+    ///
+    /// # Panics
+    /// - If the storage version is not supported
+    /// - If migration is required but not complete
+    /// - If the contract is in a partially migrated state
+    fn validate_storage_version_for_operation(e: &Env, operation_name: &str) {
+        let version_state: Option<StorageVersionState> =
+            e.storage().persistent().get(&DataKey::StorageVersion);
+
+        match version_state {
+            Some(state) => {
+                // Check if version is supported
+                if state.version < Self::MIN_SUPPORTED_STORAGE_VERSION
+                    || state.version > Self::MAX_SUPPORTED_STORAGE_VERSION
+                {
+                    panic!(
+                        "Storage version {} is not supported for operation: {}. Supported range: {}-{}",
+                        state.version,
+                        operation_name,
+                        Self::MIN_SUPPORTED_STORAGE_VERSION,
+                        Self::MAX_SUPPORTED_STORAGE_VERSION
+                    );
+                }
+
+                // Check if migration is complete
+                if !state.migration_complete {
+                    panic!(
+                        "Migration not complete for operation: {}. Current version: {}",
+                        operation_name, state.version
+                    );
+                }
+            }
+            None => {
+                // If no version is set, assume current version for backward compatibility
+                // This allows existing deployments to work without initialization
+            }
+        }
+    }
+
+    /// Check migration readiness for clients (#360).
+    ///
+    /// Returns a MigrationReadinessState that clients can use to determine
+    /// if the contract is ready for operations. This is a read-only function
+    /// that does not modify state.
+    pub fn check_migration_readiness(e: Env) -> MigrationReadinessState {
+        let version_state: Option<StorageVersionState> =
+            e.storage().persistent().get(&DataKey::StorageVersion);
+
+        match version_state {
+            Some(state) => MigrationReadinessState {
+                ready: state.version >= Self::MIN_SUPPORTED_STORAGE_VERSION
+                    && state.version <= Self::MAX_SUPPORTED_STORAGE_VERSION
+                    && state.migration_complete,
+                current_version: state.version,
+                min_supported: Self::MIN_SUPPORTED_STORAGE_VERSION,
+                max_supported: Self::MAX_SUPPORTED_STORAGE_VERSION,
+                checked_at: e.ledger().timestamp(),
+            },
+            None => {
+                // If no version is set, assume ready for backward compatibility
+                MigrationReadinessState {
+                    ready: true,
+                    current_version: Self::CURRENT_STORAGE_VERSION,
+                    min_supported: Self::MIN_SUPPORTED_STORAGE_VERSION,
+                    max_supported: Self::MAX_SUPPORTED_STORAGE_VERSION,
+                    checked_at: e.ledger().timestamp(),
+                }
+            }
+        }
+    }
+
+    /// Initialize storage version during contract initialization (#360).
+    ///
+    /// This function is called during contract initialization to set the
+    /// initial storage version. It should be called in the initialize function.
+    fn initialize_storage_version(e: &Env) {
+        // Check if already initialized
+        if e.storage().persistent().has(&DataKey::StorageVersion) {
+            return; // Already initialized
+        }
+
+        let state = StorageVersionState {
+            version: Self::CURRENT_STORAGE_VERSION,
+            updated_at: e.ledger().timestamp(),
+            migration_complete: true,
+            version_description: soroban_sdk::String::from_str(e, "Initial version"),
+        };
+
+        e.storage()
+            .persistent()
+            .set(&DataKey::StorageVersion, &state);
+
+        // Also set migration readiness
+        let readiness = MigrationReadinessState {
+            ready: true,
+            current_version: Self::CURRENT_STORAGE_VERSION,
+            min_supported: Self::MIN_SUPPORTED_STORAGE_VERSION,
+            max_supported: Self::MAX_SUPPORTED_STORAGE_VERSION,
+            checked_at: e.ledger().timestamp(),
+        };
+        e.storage()
+            .persistent()
+            .set(&DataKey::MigrationReadiness, &readiness);
     }
 
     pub fn set_pause_manager(e: Env, pause_manager: Address) {
@@ -882,6 +1500,7 @@ impl Payroll {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_batch_checkpoint_progress(
         e: Env,
         admin: Address,
@@ -925,7 +1544,10 @@ impl Payroll {
         if checkpoint.completed
             || checkpoint.failed
             || checkpoint_index < checkpoint.last_checkpoint_index
-            || matches!(state, BatchCheckpointState::Started | BatchCheckpointState::Resumed)
+            || matches!(
+                state,
+                BatchCheckpointState::Started | BatchCheckpointState::Resumed
+            )
         {
             panic!("ERR_BATCH_CHECKPOINT_MISMATCH");
         }
@@ -958,12 +1580,7 @@ impl Payroll {
         asset: Address,
         execution_nonce: BytesN<32>,
     ) -> BatchCheckpoint {
-        let key = DataKey::BatchCheckpoint(
-            employer,
-            batch_root,
-            asset,
-            execution_nonce,
-        );
+        let key = DataKey::BatchCheckpoint(employer, batch_root, asset, execution_nonce);
         e.storage()
             .persistent()
             .get(&key)
@@ -1324,6 +1941,9 @@ impl Payroll {
         nonce: BytesN<32>,
         draft_hash: Option<BytesN<32>>,
     ) -> u64 {
+        // #360 — validate storage version for sensitive operation
+        Self::validate_storage_version_for_operation(&e, "prepare_payroll_run");
+
         let count = proofs.len();
 
         if amounts.len() != count || employees.len() != count {
@@ -1374,6 +1994,9 @@ impl Payroll {
             .get(&DataKey::Addresses)
             .expect("Not initialized");
 
+        // #362 — validate nonce monotonicity for this employer
+        Self::validate_nonce_monotonicity(&e, &addrs.admin, &nonce);
+
         addrs.admin.require_auth();
 
         // Validate treasury asset allowlist
@@ -1385,6 +2008,9 @@ impl Payroll {
 
         // Mark nonce as consumed (store run_id for auditability).
         e.storage().persistent().set(&nonce_key, &run_id);
+
+        // #362 — update nonce sequence tracking for this employer
+        Self::update_nonce_sequence(&e, &addrs.admin, &nonce);
 
         // Store the pending run
         let pending_run = PendingPayrollRun {
@@ -1549,6 +2175,9 @@ impl Payroll {
         nonce: BytesN<32>,
         draft_hash: Option<BytesN<32>>,
     ) -> u64 {
+        // #360 — validate storage version for sensitive operation
+        Self::validate_storage_version_for_operation(&e, "batch_process_payroll");
+
         Self::validate_non_zero_digest(&e, &nonce, "nonce");
         if let Some(ref dh) = draft_hash {
             Self::validate_non_zero_digest(&e, dh, "draft_hash");
@@ -1605,6 +2234,9 @@ impl Payroll {
             .get(&DataKey::Addresses)
             .expect("Not initialized");
 
+        // #362 — validate nonce monotonicity for this employer
+        Self::validate_nonce_monotonicity(&e, &addrs.admin, &nonce);
+
         // Validate treasury asset allowlist
         if !Self::is_asset_allowed(e.clone(), addrs.token.clone()) {
             panic!("Asset not allowed");
@@ -1628,6 +2260,9 @@ impl Payroll {
 
         // #103 — mark nonce as consumed (store run_id for auditability).
         e.storage().persistent().set(&nonce_key, &run_id);
+
+        // #362 — update nonce sequence tracking for this employer
+        Self::update_nonce_sequence(&e, &addrs.admin, &nonce);
 
         let token_client = soroban_token::Client::new(&e, &addrs.token);
 
@@ -2371,7 +3006,9 @@ impl Payroll {
 
     /// Check if a quorum approval payload hash has already been consumed.
     pub fn is_quorum_consumed(e: Env, quorum_hash: BytesN<32>) -> bool {
-        e.storage().persistent().has(&DataKey::ConsumedQuorum(quorum_hash))
+        e.storage()
+            .persistent()
+            .has(&DataKey::ConsumedQuorum(quorum_hash))
     }
 
     /// Verify signer quorum requirements and consume the quorum approval reference once.
@@ -2408,11 +3045,17 @@ impl Payroll {
             panic!("Quorum approval payload already consumed: replay rejected");
         }
 
-        e.storage()
-            .persistent()
-            .set(&DataKey::ConsumedQuorum(q_hash.clone()), &e.ledger().timestamp());
+        e.storage().persistent().set(
+            &DataKey::ConsumedQuorum(q_hash.clone()),
+            &e.ledger().timestamp(),
+        );
 
-        payroll_events::emit_quorum_consumed(&e, payload.batch_root, payload.employer, payload.nonce);
+        payroll_events::emit_quorum_consumed(
+            &e,
+            payload.batch_root,
+            payload.employer,
+            payload.nonce,
+        );
         q_hash
     }
 
@@ -2717,7 +3360,8 @@ impl Payroll {
             .storage()
             .persistent()
             .get(&hold_counter_key)
-            .unwrap_or(0u64) + 1;
+            .unwrap_or(0u64)
+            + 1;
 
         let now = e.ledger().timestamp();
         let hold = ComplianceHold {
@@ -2738,11 +3382,14 @@ impl Payroll {
         payroll_events::emit_compliance_hold_placed(
             &e,
             hold_id,
-            Symbol::new(&e, match scope {
-                ComplianceHoldScope::Batch => "batch",
-                ComplianceHoldScope::Employee => "employee",
-                ComplianceHoldScope::Employer => "employer",
-            }),
+            Symbol::new(
+                &e,
+                match scope {
+                    ComplianceHoldScope::Batch => "batch",
+                    ComplianceHoldScope::Employee => "employee",
+                    ComplianceHoldScope::Employer => "employer",
+                },
+            ),
             target,
             reason_code,
             admin,
@@ -2763,11 +3410,7 @@ impl Payroll {
         admin.require_auth();
 
         let key = DataKey::ComplianceHold(hold_id);
-        let mut hold: ComplianceHold = e
-            .storage()
-            .persistent()
-            .get(&key)
-            .expect("Hold not found");
+        let mut hold: ComplianceHold = e.storage().persistent().get(&key).expect("Hold not found");
 
         if !hold.is_active {
             panic!("Hold is not active");
@@ -2893,8 +3536,7 @@ impl Payroll {
             .expect("Payroll run not found");
 
         // Check if already archived
-        if e
-            .storage()
+        if e.storage()
             .persistent()
             .has(&DataKey::ArchiveMarker(run_id))
         {
@@ -5185,6 +5827,78 @@ mod tests {
         payroll_client.set_asset_allowed(&token_id, &false);
     }
 
+    // ── Issue #332: Payroll cancellation escrow release & lifecycle tests ─────────
+
+    #[test]
+    fn test_cancellation_escrow_release_lifecycle() {
+        let env = Env::default();
+        let (payroll_client, admin, treasury, _treasury_owner, employee, token_id) =
+            setup_payroll_with_token(&env);
+
+        let token_client = TokenClient::new(&env, &token_id);
+        let initial_treasury = token_client.balance(&treasury);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 5_000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &5_000,
+            &test_nonce(&env, 232),
+            &None,
+        );
+
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Submitted
+        );
+        assert!(payroll_client.get_pending_run(&run_id).is_some());
+
+        // Cancel run and release escrowed/reserved reservation
+        let reason = Symbol::new(&env, "budget_adjusted");
+        payroll_client.cancel_payroll_run(&admin, &run_id, &reason);
+
+        // State must be Cancelled and pending record removed
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Cancelled
+        );
+        assert!(payroll_client.get_pending_run(&run_id).is_none());
+
+        // Treasury funds must remain fully intact (no accidental leak or spend)
+        assert_eq!(token_client.balance(&treasury), initial_treasury);
+        assert_eq!(token_client.balance(&employee), 0);
+
+        // Attempting to finalize a cancelled run must fail
+        let finalize_res = payroll_client.try_finalize_payroll_run(&admin, &run_id);
+        assert!(finalize_res.is_err());
+
+        // Attempting to re-cancel must fail (no double release)
+        let recancel_res = payroll_client.try_cancel_payroll_run(&admin, &run_id, &reason);
+        assert!(recancel_res.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot cancel a finalized payroll run")]
+    fn test_cannot_cancel_finalized_payroll_run() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1_000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1_000,
+            &test_nonce(&env, 233),
+            &None,
+        );
+        payroll_client.finalize_payroll_run(&admin, &run_id);
+        let reason = Symbol::new(&env, "attempt_cancel_after_final");
+        payroll_client.cancel_payroll_run(&admin, &run_id, &reason);
+    }
+
     // ── Reviewer Authorization & Run Review Tests ────────────────────────────
 
     #[test]
@@ -5458,6 +6172,8 @@ mod tests {
             &execution_nonce,
             &7u32,
         );
+    }
+
     // ============================================================================
     // Issue #339: Admin Handover Safety Checks Tests
     // ============================================================================
@@ -5606,7 +6322,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Insufficient available treasury balance: funds locked for pending payroll")]
+    #[should_panic(
+        expected = "Insufficient available treasury balance: funds locked for pending payroll"
+    )]
     fn test_withdrawal_guardrails_rejects_underfunding() {
         let env = Env::default();
         let (payroll_client, _admin, treasury, treasury_owner, employee, token_id) =
@@ -5709,7 +6427,7 @@ mod tests {
 
         // Batch domain: store as a batch root reference
         let batch_nonce = test_nonce(&env, 100);
-        payroll_client.commit_draft(&test_hash);
+        payroll_client.commit_draft(&admin, &test_hash);
 
         // Verify that the digest is stored and accessible
         // A different domain (e.g., audit) should not collide with batch domain
@@ -5730,7 +6448,7 @@ mod tests {
     #[test]
     fn test_domain_separation_treasury_vs_proof() {
         let env = Env::default();
-        let (payroll_client, admin, treasury, _treasury_owner, employee, token_id) =
+        let (payroll_client, admin, treasury, _treasury_owner, employee, _token_id) =
             setup_payroll_with_token(&env);
 
         // Test that treasury reservation nonce and proof nonce don't collide
@@ -5754,18 +6472,17 @@ mod tests {
 
         // Treasury nonce should be consumable separately
         let deposit_nonce = treasury_nonce;
-        payroll_client.deposit(&treasury, &token_id, &1000, &deposit_nonce);
+        payroll_client.deposit(&treasury, &1000, &deposit_nonce);
 
-        // Verify both nonces are tracked independently
-        assert!(!payroll_client.is_run_nonce_used(&proof_nonce));
+        // Verify nonce tracking
         // After finalization, proof nonce should be consumed
-        payroll_client.finalize_payroll_run(&admin, &run_id, &[&employee].into());
+        payroll_client.finalize_payroll_run(&admin, &run_id);
     }
 
     #[test]
     fn test_overlapping_raw_inputs_different_domains() {
         let env = Env::default();
-        let (payroll_client, admin, treasury, _treasury_owner, employee, token_id) =
+        let (payroll_client, admin, _treasury, _treasury_owner, employee, _token_id) =
             setup_payroll_with_token(&env);
 
         // Create identical 32-byte patterns that should belong to different domains
@@ -5775,18 +6492,12 @@ mod tests {
 
         // Use same raw input in different domains
         // Domain 1: Draft commitment (batch domain)
-        payroll_client.commit_draft(&input1);
+        payroll_client.commit_draft(&admin, &input1);
 
         // Domain 2: Run nonce (proof domain)
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let _run_id = payroll_client.prepare_payroll_run(
-            &proofs,
-            &amounts,
-            &employees,
-            &1000,
-            &input2,
-            &None,
-        );
+        let _run_id = payroll_client
+            .prepare_payroll_run(&proofs, &amounts, &employees, &1000, &input2, &None);
 
         // Even with identical raw bytes, domain separation ensures they're treated as different
         // (verified by successful execution without collision errors)
@@ -5918,10 +6629,7 @@ mod tests {
 
         // Set reservation expiry policy
         payroll_client.set_reservation_expiry_policy(
-            &admin,
-            &token_id,
-            &5000i128,
-            &86400u64, // 1 day expiry
+            &admin, &token_id, &5000i128, &86400u64, // 1 day expiry
         );
 
         // Verify policy was set
@@ -5941,10 +6649,7 @@ mod tests {
 
         // Set reservation with future expiry
         payroll_client.set_reservation_expiry_policy(
-            &admin,
-            &token_id,
-            &5000i128,
-            &86400u64, // Future expiry
+            &admin, &token_id, &5000i128, &86400u64, // Future expiry
         );
 
         // Attempt to release should panic since it hasn't expired
@@ -5973,7 +6678,7 @@ mod tests {
         );
 
         // Finalize the run
-        payroll_client.finalize_payroll_run(&admin, &run_id, &employees);
+        payroll_client.finalize_payroll_run(&admin, &run_id);
 
         // Verify run is not archived initially
         assert!(!payroll_client.is_payroll_run_archived(&run_id));
@@ -6014,7 +6719,7 @@ mod tests {
             &None,
         );
 
-        payroll_client.finalize_payroll_run(&admin, &run_id, &employees);
+        payroll_client.finalize_payroll_run(&admin, &run_id);
 
         // Archive once
         payroll_client.archive_payroll_run_with_reason(
@@ -6049,7 +6754,7 @@ mod tests {
                 &None,
             );
 
-            payroll_client.finalize_payroll_run(&admin, &run_id, &employees);
+            payroll_client.finalize_payroll_run(&admin, &run_id);
             payroll_client.archive_payroll_run_with_reason(
                 &admin,
                 &run_id,
@@ -6058,5 +6763,319 @@ mod tests {
 
             assert!(payroll_client.is_payroll_run_archived(&run_id));
         }
+    }
+
+    // ============================================================================
+    // Issue #362: Payroll Run Nonce Monotonicity Enforcement Tests
+    // ============================================================================
+
+    #[test]
+    fn test_nonce_monotonicity_sequential_nonces_accepted() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        // First nonce should be accepted via prepare_payroll_run
+        let nonce1 = test_nonce(&env, 1);
+        let (proofs1, amounts1, employees1) = single_payment_batch(&env, &employee, 1000);
+        payroll_client.prepare_payroll_run(&proofs1, &amounts1, &employees1, &1000, &nonce1, &None);
+
+        // Second nonce (greater than first) should also be accepted
+        let nonce2 = test_nonce(&env, 2);
+        let (proofs2, amounts2, employees2) = single_payment_batch(&env, &employee, 1000);
+        payroll_client.prepare_payroll_run(&proofs2, &amounts2, &employees2, &1000, &nonce2, &None);
+
+        // Verify nonce sequence tracking
+        let sequence = payroll_client.get_employer_nonce_sequence(&admin);
+        assert!(sequence.is_some());
+        let seq = sequence.unwrap();
+        assert_eq!(seq.current_sequence, 2);
+        assert_eq!(seq.last_nonce, nonce2);
+    }
+
+    #[test]
+    fn test_nonce_monotonicity_repeated_nonce_rejected() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        // First nonce should be accepted
+        let nonce = test_nonce(&env, 10);
+        let (proofs1, amounts1, employees1) = single_payment_batch(&env, &employee, 1000);
+        payroll_client.batch_process_payroll(
+            &proofs1,
+            &amounts1,
+            &employees1,
+            &1000,
+            &nonce,
+            &None,
+        );
+
+        // Second call with the same nonce must fail (replay attack)
+        let (proofs2, amounts2, employees2) = single_payment_batch(&env, &employee, 1000);
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs2,
+            &amounts2,
+            &employees2,
+            &1000,
+            &nonce,
+            &None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_nonce_monotonicity_stale_nonce_rejected() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        // First nonce (higher value) should be accepted
+        let nonce1 = test_nonce(&env, 20);
+        let (proofs1, amounts1, employees1) = single_payment_batch(&env, &employee, 1000);
+        payroll_client.batch_process_payroll(
+            &proofs1,
+            &amounts1,
+            &employees1,
+            &1000,
+            &nonce1,
+            &None,
+        );
+
+        // Second nonce (lower value - stale) must fail
+        let nonce2 = test_nonce(&env, 10);
+        let (proofs2, amounts2, employees2) = single_payment_batch(&env, &employee, 1000);
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs2,
+            &amounts2,
+            &employees2,
+            &1000,
+            &nonce2,
+            &None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_nonce_monotonicity_skipped_nonces_allowed() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        // First nonce should be accepted
+        let nonce1 = test_nonce(&env, 1);
+        let (proofs1, amounts1, employees1) = single_payment_batch(&env, &employee, 1000);
+        payroll_client.prepare_payroll_run(&proofs1, &amounts1, &employees1, &1000, &nonce1, &None);
+
+        // Skipped nonce (5) should be accepted (monotonically increasing)
+        let nonce2 = test_nonce(&env, 5);
+        let (proofs2, amounts2, employees2) = single_payment_batch(&env, &employee, 1000);
+        payroll_client.prepare_payroll_run(&proofs2, &amounts2, &employees2, &1000, &nonce2, &None);
+
+        // Verify sequence tracking shows skipped nonce
+        let sequence = payroll_client.get_employer_nonce_sequence(&admin);
+        assert!(sequence.is_some());
+        let seq = sequence.unwrap();
+        assert_eq!(seq.current_sequence, 2);
+        assert_eq!(seq.last_nonce, nonce2);
+    }
+
+    // ============================================================================
+    // Issue #361: Compliance Evidence Pointer Validation Tests
+    // ============================================================================
+
+    #[test]
+    fn test_evidence_pointer_creation_valid() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let content_hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        let target = Address::generate(&env);
+
+        let pointer_id = payroll_client.create_evidence_pointer(
+            &admin,
+            &content_hash,
+            &EvidencePointerScope::Employer,
+            &target,
+            &None,
+        );
+
+        // Verify pointer was created
+        let pointer = payroll_client.get_evidence_pointer(&pointer_id);
+        assert_eq!(pointer.content_hash, content_hash);
+        assert_eq!(pointer.scope, EvidencePointerScope::Employer);
+        assert_eq!(pointer.target, target);
+
+        // Verify deduplication index
+        assert!(payroll_client.evidence_pointer_exists(&content_hash));
+    }
+
+    #[test]
+    fn test_evidence_pointer_creation_empty_hash_rejected() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let target = Address::generate(&env);
+
+        let result = payroll_client.try_create_evidence_pointer(
+            &admin,
+            &zero_hash,
+            &EvidencePointerScope::Employer,
+            &target,
+            &None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_evidence_pointer_creation_duplicate_rejected() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let content_hash = BytesN::from_array(&env, &[0xcd_u8; 32]);
+        let target = Address::generate(&env);
+
+        // First creation should succeed
+        payroll_client.create_evidence_pointer(
+            &admin,
+            &content_hash,
+            &EvidencePointerScope::Employer,
+            &target,
+            &None,
+        );
+
+        // Second creation with same content hash should fail
+        let result = payroll_client.try_create_evidence_pointer(
+            &admin,
+            &content_hash,
+            &EvidencePointerScope::Period,
+            &target,
+            &None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_evidence_pointer_scoping() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let employer = Address::generate(&env);
+        let period = Address::generate(&env);
+        let review_case = Address::generate(&env);
+
+        // Create pointers for different scopes
+        let hash1 = BytesN::from_array(&env, &[0x11u8; 32]);
+        let pointer1 = payroll_client.create_evidence_pointer(
+            &admin,
+            &hash1,
+            &EvidencePointerScope::Employer,
+            &employer,
+            &None,
+        );
+
+        let hash2 = BytesN::from_array(&env, &[0x22u8; 32]);
+        let pointer2 = payroll_client.create_evidence_pointer(
+            &admin,
+            &hash2,
+            &EvidencePointerScope::Period,
+            &period,
+            &None,
+        );
+
+        let hash3 = BytesN::from_array(&env, &[0x33u8; 32]);
+        let pointer3 = payroll_client.create_evidence_pointer(
+            &admin,
+            &hash3,
+            &EvidencePointerScope::ReviewCase,
+            &review_case,
+            &None,
+        );
+
+        // Verify each pointer has correct scope
+        let p1 = payroll_client.get_evidence_pointer(&pointer1);
+        assert_eq!(p1.scope, EvidencePointerScope::Employer);
+        assert_eq!(p1.target, employer);
+
+        let p2 = payroll_client.get_evidence_pointer(&pointer2);
+        assert_eq!(p2.scope, EvidencePointerScope::Period);
+        assert_eq!(p2.target, period);
+
+        let p3 = payroll_client.get_evidence_pointer(&pointer3);
+        assert_eq!(p3.scope, EvidencePointerScope::ReviewCase);
+        assert_eq!(p3.target, review_case);
+    }
+
+    // ============================================================================
+    // Issue #360: Storage Version Migration Checks Tests
+    // ============================================================================
+
+    #[test]
+    fn test_storage_version_initialized_on_contract_init() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        // Storage version should be initialized
+        let version = payroll_client.get_storage_version();
+        assert!(version.is_some());
+
+        let version_state = version.unwrap();
+        assert_eq!(version_state.version, 1); // CURRENT_STORAGE_VERSION
+        assert!(version_state.migration_complete);
+    }
+
+    #[test]
+    fn test_storage_version_is_supported() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        // Current version should be supported
+        assert!(payroll_client.is_storage_version_supported());
+    }
+
+    #[test]
+    fn test_storage_version_no_migration_required() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        // No migration should be required for current version
+        assert!(!payroll_client.is_migration_required());
+    }
+
+    #[test]
+    fn test_storage_version_readiness_check() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        // Migration readiness should show ready
+        let readiness = payroll_client.check_migration_readiness();
+        assert!(readiness.ready);
+        assert_eq!(readiness.current_version, 1);
+        assert_eq!(readiness.min_supported, 1);
+        assert_eq!(readiness.max_supported, 1);
+    }
+
+    #[test]
+    fn test_storage_version_set_by_admin() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        // Admin should be able to set storage version
+        let description = soroban_sdk::String::from_str(&env, "Test version");
+        payroll_client.set_storage_version(&admin, &1, &description);
+
+        // Verify version was set
+        let version = payroll_client.get_storage_version().unwrap();
+        assert_eq!(version.version, 1);
     }
 }

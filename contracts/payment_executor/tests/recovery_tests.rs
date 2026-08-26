@@ -565,6 +565,7 @@ fn test_partial_batch_failure_individual_retry_completes_payroll() {
     // Recovery: pay emp1 and emp3 individually in the same open period.
     executor.execute_payment(&company_id, &emp1, &100, &pa1, &pb1, &pc1, &null1, &1);
     executor.execute_payment(&company_id, &emp3, &200, &pa3, &pb3, &pc3, &null3, &1);
+    assert!(executor.is_paid(&emp1, &1));
     assert!(
         executor.is_paid(&emp1, &1),
         "emp1 must succeed after individual recovery"
