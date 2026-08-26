@@ -9,6 +9,14 @@ use payroll_registry::PayrollRegistryClient;
 use proof_verifier::ProofVerifierClient;
 use salary_commitment::SalaryCommitmentContractClient;
 
+// ── Issue #357: overpayment review guard ─────────────────────────────────────
+pub mod events;
+pub mod reviews;
+use reviews::{
+    emit_archival_blocked, get_overpayment_review, has_open_review, open_overpayment_review,
+    resolve_overpayment_review, OverpaymentReview, ReviewStatus,
+};
+
 const MAX_BATCH: u32 = 50;
 
 #[contract]
@@ -256,6 +264,15 @@ pub enum DataKey {
     DraftCommitment(BytesN<32>),
     /// Pending emergency withdrawal request (#104).
     EmergencyRequest,
+    /// Settlement completion marker for a payroll batch (#358).
+    ///
+    /// Written atomically with the `PayrollRun` record at the end of
+    /// `batch_process_payroll`.  Its presence signals that the run reached
+    /// the finalization step; any duplicate call with the same `run_id`
+    /// (via the nonce guard) or an explicit re-settlement attempt is rejected
+    /// before any funds move.  The value stored is the `executed_at` ledger
+    /// timestamp for lightweight auditability.
+    SettledBatch(u64),
     // Future upgrade example (issue #196):
     // PayrollRunV2(u64),  // Would be added here when schema evolution is needed
 }
@@ -878,9 +895,11 @@ impl Payroll {
             // data   : (employee, amount)
         }
 
+        let executed_at = e.ledger().timestamp();
+
         let run = PayrollRun {
             run_id,
-            executed_at: e.ledger().timestamp(),
+            executed_at,
             admin: addrs.admin.clone(),
             total_amount: expected_total_spend,
             employee_count: count,
@@ -889,6 +908,14 @@ impl Payroll {
             reconciliation_status: ReconciliationStatus::Unreconciled,
             metadata_hash: BytesN::from_array(&e, &[0u8; 32]),
         };
+
+        // #358 — write the settlement completion marker atomically with the
+        // run record.  This is the authoritative on-chain proof that the batch
+        // reached finalization.  A Soroban transaction is atomic: if any step
+        // above panicked, neither write reaches persistent storage.
+        e.storage()
+            .persistent()
+            .set(&DataKey::SettledBatch(run_id), &executed_at);
         e.storage()
             .persistent()
             .set(&DataKey::PayrollRun(run_id), &run);
@@ -987,6 +1014,15 @@ impl Payroll {
     ///
     /// Only the `admin` may update the reconciliation status.
     /// Emits a `reconciliation_updated` event.
+    ///
+    /// # Overpayment review guard (issue #357)
+    ///
+    /// If the run has an open overpayment review, transitioning to
+    /// `ReconciliationStatus::Reconciled` is blocked.  The transition to
+    /// `Unreconciled` or `Failed` is still allowed so operators can roll back a
+    /// premature reconciliation without closing the review first.  An
+    /// `("payroll", "archival_blocked")` event is emitted before the panic so
+    /// off-chain indexers get a structured signal.
     pub fn update_reconciliation_status(
         e: Env,
         admin: Address,
@@ -1005,6 +1041,15 @@ impl Payroll {
         }
 
         admin.require_auth();
+
+        // ── Issue #357: block archival while an open review exists ────────────
+        if status == ReconciliationStatus::Reconciled && has_open_review(&e, run_id) {
+            // Fetch the review to include its ID in the guard event.
+            if let Some(rev) = get_overpayment_review(&e, run_id) {
+                emit_archival_blocked(&e, run_id, rev.review_id);
+            }
+            panic!("Run has an open overpayment review; resolve it before archiving");
+        }
 
         let run_key = DataKey::PayrollRun(run_id);
 
@@ -1337,6 +1382,118 @@ impl Payroll {
             .get(&DataKey::PayrollRun(run_id))
             .expect("Run not found");
         run.metadata_hash == expected_hash
+    }
+
+    // ── Issue #357: overpayment review guard ──────────────────────────────────
+
+    /// Flag a completed payroll run as suspected overpayment, opening a review.
+    ///
+    /// Opening a review blocks the run from being marked `Reconciled` until the
+    /// review is explicitly closed via `resolve_overpayment_review`.  Settled
+    /// token transfers are never touched; this is a purely administrative guard.
+    ///
+    /// At most one **open** review may exist per run.  If a previous review on
+    /// the same run was already `Resolved`, a new one may be opened.
+    ///
+    /// # Auth
+    ///
+    /// Only the contract `admin` may open a review.
+    ///
+    /// # Panics
+    ///
+    /// * `"Not initialized"` — contract has not been initialized.
+    /// * `"Unauthorized"` — caller is not the admin.
+    /// * `"Run not found"` — no completed run exists for `run_id`.
+    /// * `"Review already open for this run"` — an open review already exists.
+    ///
+    /// # Returns
+    ///
+    /// The newly assigned `review_id`.
+    pub fn open_overpayment_review(e: Env, admin: Address, run_id: u64) -> u64 {
+        Self::require_not_paused(&e);
+
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        // Verify the run exists before opening a review on it.
+        if !e
+            .storage()
+            .persistent()
+            .has(&DataKey::PayrollRun(run_id))
+        {
+            panic!("Run not found");
+        }
+
+        open_overpayment_review(&e, &admin, run_id)
+    }
+
+    /// Resolve an open overpayment review, removing the archival block.
+    ///
+    /// Resolution permanently closes the review record and stores the supplied
+    /// `reason` on-chain for the audit trail.  The reason must be a non-empty
+    /// symbol.  **Settled payments are never reversed or modified.**
+    ///
+    /// # Auth
+    ///
+    /// Only the contract `admin` may resolve a review.
+    ///
+    /// # Panics
+    ///
+    /// * `"Not initialized"` — contract has not been initialized.
+    /// * `"Unauthorized"` — caller is not the admin.
+    /// * `"Review not found"` — no review record exists for `run_id`.
+    /// * `"Review already resolved"` — the review has already been closed.
+    /// * `"Resolution reason must not be empty"` — an empty reason was supplied.
+    pub fn resolve_overpayment_review(
+        e: Env,
+        admin: Address,
+        run_id: u64,
+        reason: Symbol,
+    ) {
+        Self::require_not_paused(&e);
+
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        resolve_overpayment_review(&e, &admin, run_id, reason)
+    }
+
+    /// Return the overpayment review record for a given run, if one exists.
+    ///
+    /// Returns `None` if no review has ever been opened for this run.
+    pub fn get_overpayment_review(e: Env, run_id: u64) -> Option<OverpaymentReview> {
+        get_overpayment_review(&e, run_id)
+    }
+
+    /// Return `true` if the given run has a currently open overpayment review.
+    ///
+    /// This is a lightweight guard helper that other contracts or off-chain
+    /// tooling can poll without deserializing the full review record.
+    pub fn has_open_review(e: Env, run_id: u64) -> bool {
+        has_open_review(&e, run_id)
+    }
+
+    /// Return the current `ReviewStatus` for a run's overpayment review.
+    ///
+    /// Returns `None` if no review exists for the run.
+    pub fn get_review_status(e: Env, run_id: u64) -> Option<ReviewStatus> {
+        get_overpayment_review(&e, run_id).map(|r| r.status)
     }
 }
 
