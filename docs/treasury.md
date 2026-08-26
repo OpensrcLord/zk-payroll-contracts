@@ -15,3 +15,13 @@ Payroll execution requires appropriate authorization from both the company admin
 - **Company Admin Auth**: Explicitly checked via `company.admin.require_auth()`.
 - **Treasury Auth**: Implicitly enforced by the token contract when `token_client.transfer(&company.treasury, ...)` is called. Soroban's auth framework requires the `company.treasury` signature to be present in the transaction auth entries.
 - **Asset Allowlist**: Checked via `is_asset_allowed()`.
+
+## Reserve Boundary Checks
+The treasury must hold at least the full payment amount before payroll execution. The payment executor transfers funds before recording the payment, nullifier, period count, or running total, so an insufficient reserve fails without creating a partial payment record.
+
+The payment executor boundary suite covers:
+- An exact reserve balance, which transfers successfully and leaves the treasury at zero.
+- A reserve one unit below the requested payment, which is rejected without changing balances or payment bookkeeping.
+- A zero reserve for a positive payment, which is rejected without changing balances or payment bookkeeping.
+
+Operational callers should treat an insufficient-balance failure as an actionable funding error: replenish the registered treasury and retry with the same payment inputs only after confirming the failed transaction was not committed.
