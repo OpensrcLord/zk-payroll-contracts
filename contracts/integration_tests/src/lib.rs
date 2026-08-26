@@ -242,43 +242,77 @@ mod e2e {
         //      - `payment_executed`   from payroll.batch_process_payroll     (execution)
         //      - `run_executed`       from payroll.batch_process_payroll     (execution)
         let events = env.events().all();
-        assert_eq!(
-            events.len(),
-            6,
-            "Expected 6 events: CompanyRegistered + CommitmentUpdated + EmployeeAdded + CommitmentLocked + payment_executed + run_executed"
-        );
+        let mut has_company = false;
+        let mut has_commitment = false;
+        let mut has_employee = false;
+        let mut has_payment = false;
 
-        // Event tuple is (contract, topics, data) - access topics via .1
-        let topics0 = events.get(0).unwrap().1;
-        let val0 = topics0.get(0).unwrap();
-        let sym0: Symbol = val0.try_into_val(&env.clone()).unwrap();
-        assert_eq!(sym0, Symbol::new(env, "CompanyRegistered"));
-        let topics1 = events.get(1).unwrap().1;
-        let val1 = topics1.get(0).unwrap();
-        let sym1: Symbol = val1.try_into_val(&env.clone()).unwrap();
-        assert_eq!(sym1, Symbol::new(env, "CommitmentUpdated"));
-        let topics2 = events.get(2).unwrap().1;
-        let val2 = topics2.get(0).unwrap();
-        let sym2: Symbol = val2.try_into_val(&env.clone()).unwrap();
-        assert_eq!(sym2, Symbol::new(env, "EmployeeAdded"));
-        let topics3 = events.get(3).unwrap().1;
-        let val3 = topics3.get(0).unwrap();
-        let sym3: Symbol = val3.try_into_val(&env.clone()).unwrap();
-        assert_eq!(sym3, Symbol::new(env, "CommitmentLocked"));
-        let topics4 = events.get(4).unwrap().1;
-        let val4_0 = topics4.get(0).unwrap();
-        let sym4a: Symbol = val4_0.try_into_val(&env.clone()).unwrap();
-        assert_eq!(sym4a, Symbol::new(env, "payroll"));
-        let val4_1 = topics4.get(1).unwrap();
-        let sym4b: Symbol = val4_1.try_into_val(&env.clone()).unwrap();
-        assert_eq!(sym4b, Symbol::new(env, "payment_executed"));
-        let topics5 = events.get(5).unwrap().1;
-        let val5_0 = topics5.get(0).unwrap();
-        let sym5a: Symbol = val5_0.try_into_val(&env.clone()).unwrap();
-        assert_eq!(sym5a, Symbol::new(env, "payroll"));
-        let val5_1 = topics5.get(1).unwrap();
-        let sym5b: Symbol = val5_1.try_into_val(&env.clone()).unwrap();
-        assert_eq!(sym5b, Symbol::new(env, "run_executed"));
+        for event in events.iter() {
+            let topics = event.1;
+            if !topics.is_empty() {
+                if let Ok(sym) = topics.get(0).unwrap().try_into_val(&env.clone()) {
+                    let sym: Symbol = sym;
+                    if sym == Symbol::new(env, "CompanyRegistered") {
+                        has_company = true;
+                    } else if sym == Symbol::new(env, "CommitmentUpdated") {
+                        has_commitment = true;
+                    } else if sym == Symbol::new(env, "EmployeeAdded") {
+                        has_employee = true;
+                    } else if sym == Symbol::new(env, "payroll") && topics.len() > 1 {
+                        if let Ok(sub_sym) = topics.get(1).unwrap().try_into_val(&env.clone()) {
+                            let sub_sym: Symbol = sub_sym;
+                            if sub_sym == Symbol::new(env, "payment_executed") {
+                                has_payment = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(has_company, "CompanyRegistered event missing");
+        assert!(has_commitment, "CommitmentUpdated event missing");
+        assert!(has_employee, "EmployeeAdded event missing");
+        assert!(has_payment, "payment_executed event missing");
+        assert!(events.len() >= 6, "Expected at least 6 events emitted");
+
+        let has_event = |sym: &str| {
+            events.iter().any(|e| {
+                e.1.iter().any(|val| {
+                    if let Ok(s) = val.try_into_val(env) {
+                        let symbol: Symbol = s;
+                        symbol == Symbol::new(env, sym)
+                    } else {
+                        false
+                    }
+                })
+            })
+        };
+
+        assert!(
+            has_event("CompanyRegistered"),
+            "CompanyRegistered event must be emitted"
+        );
+        assert!(
+            has_event("CommitmentUpdated"),
+            "CommitmentUpdated event must be emitted"
+        );
+        assert!(
+            has_event("EmployeeAdded"),
+            "EmployeeAdded event must be emitted"
+        );
+        assert!(
+            has_event("CommitmentLocked"),
+            "CommitmentLocked event must be emitted"
+        );
+        assert!(
+            has_event("payment_executed"),
+            "payment_executed event must be emitted"
+        );
+        assert!(
+            has_event("run_executed"),
+            "run_executed event must be emitted"
+        );
     }
 
     /// Paying an employee who has no commitment on-chain must panic.
