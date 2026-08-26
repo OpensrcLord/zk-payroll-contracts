@@ -29,6 +29,9 @@ pub enum AuditError {
     CommitmentMismatch = 6,
     /// Supplied key material does not belong to the auditor.
     InvalidViewKey = 7,
+    /// The auditor list supplied to `prune_expired_grants` exceeds the maximum
+    /// batch size (issue #356).
+    PruneBatchTooLarge = 8,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +121,30 @@ pub struct AuditMetadataSummary {
     pub exported_by: Address,
 }
 
+// ── Issue #356: stale audit grant pruning ────────────────────────────────────
+
+/// Tombstone written to Persistent storage when a stale grant is pruned.
+///
+/// Preserves a minimal reference to the auditor's key material and the ledger
+/// sequence at which the grant expired so that downstream compliance tooling
+/// can tie pruning events back to historical audit log entries without
+/// needing to retain the full `ViewKeyRecord`.
+///
+/// Privacy guarantee: only the hash of the original `key_bytes` is stored,
+/// never the raw key material itself.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrunedGrantRef {
+    /// SHA-256 digest of the original `ViewKeyRecord.key_bytes`.
+    pub key_digest: BytesN<32>,
+    /// `ViewKeyRecord.expiration_ledger` — the sequence at which the grant lapsed.
+    pub expired_at_ledger: u32,
+    /// Ledger sequence when pruning was executed.
+    pub pruned_at_ledger: u32,
+    /// Ledger timestamp when pruning was executed.
+    pub pruned_at_timestamp: u64,
+}
+
 /// Storage key namespace.
 #[contracttype]
 pub enum DataKey {
@@ -129,6 +156,17 @@ pub enum DataKey {
     AuditLog(Symbol, u32),
     /// Pause manager address (issue #167).
     PauseManager,
+    // ── Issue #356: stale grant pruning ──────────────────────────────────────
+    /// Total number of auditor addresses ever registered (monotonic counter).
+    /// Used together with `AuditorIndex` to enumerate all known grants.
+    AuditorCount,
+    /// Maps a sequential index (u32) → auditor `Address`.
+    /// Populated by `generate_view_key`; never deleted so the list is stable
+    /// for pruning scans. Append-only to preserve XDR discriminants on upgrade.
+    AuditorIndex(u32),
+    /// Tombstone written after a stale grant is pruned (issue #356).
+    /// Keyed by auditor `Address`; value is `PrunedGrantRef`.
+    PrunedGrant(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +218,22 @@ impl AuditModule {
         env.storage()
             .persistent()
             .set(&DataKey::AuditorKey(auditor.clone()), &record);
+
+        // Issue #356: append auditor to the enumeration index so
+        // prune_expired_grants can scan all grant holders on-chain.
+        // Always appending is safe — duplicates are harmless because
+        // prune_expired_grants checks key existence before acting.
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditorCount)
+            .unwrap_or(0u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditorIndex(count), &auditor.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditorCount, &(count + 1));
 
         env.events().publish(
             (Symbol::new(&env, "ViewKeyGenerated"), auditor),
@@ -568,6 +622,128 @@ impl AuditModule {
         }
 
         Ok(matched)
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #356: stale audit grant pruning
+    // -----------------------------------------------------------------------
+
+    /// Remove expired audit grants in a single idempotent batch.
+    ///
+    /// For each auditor in `auditors`:
+    /// - If their `ViewKeyRecord` exists **and** `ledger.sequence() >
+    ///   expiration_ledger`, the record is removed and a `PrunedGrantRef`
+    ///   tombstone is written so downstream tooling can tie the pruning event
+    ///   to historical audit log entries.
+    /// - If the key is absent (never granted, or already pruned) the address
+    ///   is skipped silently — the operation is idempotent.
+    /// - If the key is present but **not yet expired** (active grant) it is
+    ///   never touched.
+    ///
+    /// Historical `AuditLogEntry` records are **never** deleted; they remain
+    /// queryable via `query_by_company` / `query_by_period` for compliance
+    /// verification even after a grant has been pruned.
+    ///
+    /// Returns the number of grants actually pruned in this call.
+    ///
+    /// Errors:
+    /// - `PruneBatchTooLarge` if `auditors.len() > MAX_PRUNE_BATCH`.
+    pub fn prune_expired_grants(
+        env: Env,
+        auditors: Vec<Address>,
+    ) -> Result<u32, AuditError> {
+        Self::require_not_paused(&env);
+
+        const MAX_PRUNE_BATCH: u32 = 50;
+        if auditors.len() > MAX_PRUNE_BATCH {
+            return Err(AuditError::PruneBatchTooLarge);
+        }
+
+        let current_sequence = env.ledger().sequence();
+        let current_timestamp = env.ledger().timestamp();
+        let mut pruned_count: u32 = 0;
+
+        for auditor in auditors.iter() {
+            let key = DataKey::AuditorKey(auditor.clone());
+
+            // Load the record; skip silently if absent (already pruned or
+            // never granted — idempotent).
+            let record: ViewKeyRecord = match env.storage().persistent().get(&key) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            // Skip active grants — never prune a key that is still valid.
+            if current_sequence <= record.expiration_ledger {
+                continue;
+            }
+
+            // Compute a digest of the original key material so the tombstone
+            // can tie back to the AuditSuccessful events without re-exposing
+            // the raw key bytes.
+            let key_digest: BytesN<32> = {
+                let mut preimage = Bytes::new(&env);
+                let key_slice: [u8; 32] = record.key_bytes.clone().into();
+                preimage.extend_from_array(&key_slice);
+                env.crypto().sha256(&preimage).into()
+            };
+
+            // Write the tombstone before removing the live record so a reader
+            // that observes the remove event can always find the tombstone.
+            let tombstone = PrunedGrantRef {
+                key_digest,
+                expired_at_ledger: record.expiration_ledger,
+                pruned_at_ledger: current_sequence,
+                pruned_at_timestamp: current_timestamp,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::PrunedGrant(auditor.clone()), &tombstone);
+
+            // Remove the live grant so it no longer authorises access.
+            env.storage().persistent().remove(&key);
+
+            // Emit a safe pruning event.  Only the key *digest* and expiry
+            // metadata are published — never the raw key bytes.
+            env.events().publish(
+                (Symbol::new(&env, "AuditGrantPruned"), auditor.clone()),
+                (record.expiration_ledger, current_sequence),
+            );
+            // topics : ("AuditGrantPruned", auditor: Address)
+            // data   : (expired_at_ledger: u32, pruned_at_ledger: u32)
+
+            pruned_count += 1;
+        }
+
+        Ok(pruned_count)
+    }
+
+    /// Return the number of auditor addresses ever registered via
+    /// `generate_view_key`.  Useful for callers building a pruning scan list
+    /// by iterating `get_auditor_at_index(0..get_registered_grant_count())`.
+    pub fn get_registered_grant_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AuditorCount)
+            .unwrap_or(0u32)
+    }
+
+    /// Return the auditor address registered at a given enumeration index.
+    ///
+    /// Indices are stable and monotonically assigned by `generate_view_key`.
+    /// Returns `None` when `index >= get_registered_grant_count()`.
+    pub fn get_auditor_at_index(env: Env, index: u32) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AuditorIndex(index))
+    }
+
+    /// Return the `PrunedGrantRef` tombstone for an auditor whose grant was
+    /// pruned, or `None` if they have never been pruned.
+    pub fn get_pruned_grant_ref(env: Env, auditor: Address) -> Option<PrunedGrantRef> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PrunedGrant(auditor))
     }
 
     // -----------------------------------------------------------------------
