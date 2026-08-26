@@ -30,7 +30,7 @@
 
 use payroll_registry::{CompanyInfo, EmployeeStatus, PendingCompanyRotation};
 use salary_commitment::{CommitmentSnapshot, PaymentNullifier, SalaryCommitment};
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
+use soroban_sdk::{Address, BytesN, Env};
 
 use payroll::{
     ContractAddresses as PayrollContractAddresses, DataKey as PayrollDataKey,

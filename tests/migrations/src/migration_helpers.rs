@@ -22,23 +22,16 @@
 //! assert_post_migration_invariants(&env, &ctx);
 //! ```
 
-use audit_module::{AuditModule, AuditModuleClient, AuditScope, ViewKeyRecord};
+use audit_module::{AuditModule, AuditModuleClient};
 use pause_manager::{PauseManager, PauseManagerClient};
 use payment_executor::{
     ContractAddresses as ExecutorContractAddresses, PaymentExecutor, PaymentExecutorClient,
 };
-use payroll::{
-    ContractAddresses as PayrollContractAddresses, Payroll, PayrollClient, PayrollRun,
-    ReconciliationStatus,
-};
-use payroll_registry::{
-    CompanyInfo, EmployeeStatus, PayrollRegistry, PayrollRegistryClient, PendingCompanyRotation,
-};
+use payroll::{Payroll, PayrollClient, ReconciliationStatus};
+use payroll_registry::{EmployeeStatus, PayrollRegistry, PayrollRegistryClient};
 use proof_verifier::{ProofVerifier, ProofVerifierClient, VerificationKey};
-use salary_commitment::{
-    SalaryCommitment, SalaryCommitmentContract, SalaryCommitmentContractClient,
-};
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, IntoVal, Symbol, Vec};
+use salary_commitment::{SalaryCommitmentContract, SalaryCommitmentContractClient};
+use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, Vec};
 use token::{Token, TokenClient};
 
 use crate::state_fixtures;
@@ -273,7 +266,7 @@ impl MigrationContext {
         self.has_nullifiers = true;
 
         // ── Payroll runs ─────────────────────────────────────────────────
-        let payroll_client = PayrollClient::new(env, &self.payroll_id);
+        let _payroll_client = PayrollClient::new(env, &self.payroll_id);
 
         // Historical run 1: Reconciled
         // We directly write to simulate pre-existing runs with specific statuses

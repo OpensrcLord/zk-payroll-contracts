@@ -284,7 +284,10 @@ impl SalaryCommitmentContract {
 
         let current_time = env.ledger().timestamp();
         if existing.updated_at > 0
-            && current_time < existing.updated_at.saturating_add(Self::ROTATION_COOLDOWN_PERIOD)
+            && current_time
+                < existing
+                    .updated_at
+                    .saturating_add(Self::ROTATION_COOLDOWN_PERIOD)
         {
             panic!("Rotation cooldown period has not elapsed");
         }

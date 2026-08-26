@@ -5,6 +5,7 @@
 ///
 /// All fixtures are deterministic and documented in `docs/fixtures-guide.md`.
 #[cfg(test)]
+#[allow(dead_code, clippy::module_inception)]
 pub mod fixtures {
     use soroban_sdk::{Address, BytesN, Env};
 
@@ -138,6 +139,7 @@ pub mod fixtures {
     // ── Test Assertions ──────────────────────────────────────────────────────
 
     #[cfg(test)]
+    #[allow(clippy::assertions_on_constants)]
     mod tests {
         use super::*;
 
@@ -163,9 +165,9 @@ pub mod fixtures {
         #[test]
         fn test_payroll_period_fixtures() {
             assert_eq!(Q1_2024_ACME.company_id, 0);
-            assert_eq!(Q1_2024_ACME.is_active, false);
+            assert!(!Q1_2024_ACME.is_active);
 
-            assert_eq!(Q2_2024_ACME.is_active, true);
+            assert!(Q2_2024_ACME.is_active);
             assert_eq!(FEB_2024_GLOBALPAY.company_id, 2);
         }
 

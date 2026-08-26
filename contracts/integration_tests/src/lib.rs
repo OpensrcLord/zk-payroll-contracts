@@ -258,14 +258,23 @@ mod e2e {
             false
         };
 
-        assert!(has_event("CompanyRegistered"), "CompanyRegistered event expected");
-        assert!(has_event("CommitmentUpdated"), "CommitmentUpdated event expected");
+        assert!(
+            has_event("CompanyRegistered"),
+            "CompanyRegistered event expected"
+        );
+        assert!(
+            has_event("CommitmentUpdated"),
+            "CommitmentUpdated event expected"
+        );
         assert!(has_event("EmployeeAdded"), "EmployeeAdded event expected");
         assert!(
             has_event("CommitmentLocked") || has_event("commitment_locked"),
             "CommitmentLocked event expected"
         );
-        assert!(has_event("payment_executed"), "payment_executed event expected");
+        assert!(
+            has_event("payment_executed"),
+            "payment_executed event expected"
+        );
         assert!(has_event("run_executed"), "run_executed event expected");
     }
 

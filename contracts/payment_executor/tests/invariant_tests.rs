@@ -385,7 +385,7 @@ fn test_batch_total_equals_sum_of_amounts() {
 #[test]
 fn test_company_totals_are_isolated() {
     let env = Env::default();
-    let (executor, registry, commitment_client, token, company_id_a, _admin_a, treasury_a) =
+    let (executor, registry, commitment_client, token, company_id_a, _admin_a, _treasury_a) =
         setup_system(&env, 100_000);
 
     // Register a second independent company on the same executor.

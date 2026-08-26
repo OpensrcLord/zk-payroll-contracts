@@ -219,10 +219,7 @@ fn test_batch_partial_failure_earlier_payments_are_permanent() {
     // Recovery: pay employees individually
     executor.execute_payment(&company_id, &emp1, &100, &pa1, &pb1, &pc1, &null1, &1);
     executor.execute_payment(&company_id, &emp3, &200, &pa3, &pb3, &pc3, &null3, &1);
-    assert!(
-        executor.is_paid(&emp3, &1),
-        "emp3 must be recoverable"
-    );
+    assert!(executor.is_paid(&emp3, &1), "emp3 must be recoverable");
     assert_eq!(executor.get_total_paid(&company_id), 100 + 300 + 200);
 }
 
