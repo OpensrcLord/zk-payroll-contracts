@@ -2108,6 +2108,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "retention_manager"
+version = "0.1.0"
+dependencies = [
+ "pause_manager",
+ "payroll_events",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "rfc6979"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2395,6 +2404,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "settlement_window"
+version = "0.1.0"
+dependencies = [
+ "pause_manager",
+ "payroll_events",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2413,6 +2431,13 @@ checksum = "75872d278a8f37ef87fa0ddbda7802605cb18344497949862c0d4dcb291eba60"
 dependencies = [
  "digest",
  "keccak",
+]
+
+[[package]]
+name = "shared_errors"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
 ]
 
 [[package]]
@@ -2999,6 +3024,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "treasury_isolation"
+version = "0.1.0"
+dependencies = [
+ "pause_manager",
+ "payroll_events",
+ "soroban-sdk",
 ]
 
 [[package]]
