@@ -57,7 +57,7 @@ pub struct PendingRotation {
     pub proposed_at: u64,
 }
 
-    /// Storage keys
+/// Storage keys
 #[contracttype]
 pub enum DataKey {
     Commitment(Address),
@@ -77,6 +77,12 @@ pub enum DataKey {
     /// Set by the admin via `lock_commitment_updates` and cleared via
     /// `unlock_commitment_updates`.
     CommitmentLock(Address),
+    /// Marks a commitment value as already bound to an employee, active or
+    /// archived (issue #242). Once set it is never cleared: a commitment
+    /// value that has participated in any active or completed payroll run
+    /// must never be reassigned to a different (or the same) employee, since
+    /// reuse would weaken privacy assumptions and confuse reconciliation.
+    CommitmentIndex(BytesN<32>),
     /// Pause manager address (issue #193).
     PauseManager,
     /// Pending admin rotation proposal (issue #192).
@@ -106,6 +112,7 @@ impl SalaryCommitmentContract {
         env.storage()
             .persistent()
             .set(&DataKey::PayrollOperator, &operator);
+        payroll_events::emit_payroll_operator_set(&env, operator);
     }
 
     /// Lock an employee's commitment to prevent updates via `update_commitment`
@@ -124,10 +131,7 @@ impl SalaryCommitmentContract {
         }
         env.storage().persistent().set(&key, &true);
 
-        env.events().publish(
-            (Symbol::new(&env, "CommitmentLocked"), employee),
-            (),
-        );
+        payroll_events::emit_commitment_locked(&env, employee);
     }
 
     /// Unlock an employee's commitment so it can be updated again.
@@ -141,10 +145,7 @@ impl SalaryCommitmentContract {
         }
         env.storage().persistent().remove(&key);
 
-        env.events().publish(
-            (Symbol::new(&env, "CommitmentUnlocked"), employee),
-            (),
-        );
+        payroll_events::emit_commitment_unlocked(&env, employee);
     }
 
     /// Check if an employee's commitment is currently locked.
@@ -168,6 +169,9 @@ impl SalaryCommitmentContract {
 
     /// Store a new salary commitment for an employee.
     /// Only the HR admin may call.
+    ///
+    /// The commitment value must be globally unique (issue #242): it cannot
+    /// already be bound to any employee, active or archived.
     pub fn store_commitment(
         env: Env,
         employee: Address,
@@ -175,6 +179,7 @@ impl SalaryCommitmentContract {
     ) -> SalaryCommitment {
         Self::require_not_paused(&env);
         Self::require_admin(&env);
+        Self::register_commitment_uniqueness(&env, &commitment);
 
         let timestamp = env.ledger().timestamp();
 
@@ -190,12 +195,7 @@ impl SalaryCommitmentContract {
         env.storage().persistent().set(&key, &salary_commitment);
 
         // Emit CommitmentUpdated event so off-chain indexers track commitment history.
-        env.events().publish(
-            (Symbol::new(&env, "CommitmentUpdated"), employee),
-            (commitment,),
-        );
-        // topics : ("CommitmentUpdated", employee)
-        // data   : (commitment,)
+        payroll_events::emit_commitment_stored(&env, employee, commitment);
 
         salary_commitment
     }
@@ -228,6 +228,8 @@ impl SalaryCommitmentContract {
             .get(&key)
             .expect("Commitment not found");
 
+        Self::register_commitment_uniqueness(&env, &new_commitment);
+
         // Archive current commitment before replacing
         Self::archive_commitment(&env, &employee, &existing.commitment, existing.version);
 
@@ -241,12 +243,7 @@ impl SalaryCommitmentContract {
 
         env.storage().persistent().set(&key, &updated);
 
-        env.events().publish(
-            (Symbol::new(&env, "CommitmentUpdated"), employee),
-            (new_commitment,),
-        );
-        // topics : ("CommitmentUpdated", employee)
-        // data   : (new_commitment,)
+        payroll_events::emit_commitment_stored(&env, employee, new_commitment);
 
         updated
     }
@@ -288,9 +285,11 @@ impl SalaryCommitmentContract {
         let rotated = Self::store_commitment(env.clone(), employee.clone(), new_commitment);
 
         // Emit an explicit rotation event
-        env.events().publish(
-            (Symbol::new(&env, "CommitmentRotated"), employee),
-            (existing.commitment, rotated.commitment.clone()),
+        payroll_events::emit_commitment_rotated(
+            &env,
+            employee,
+            existing.commitment,
+            rotated.commitment.clone(),
         );
 
         rotated
@@ -392,10 +391,7 @@ impl SalaryCommitmentContract {
         env.storage().persistent().set(&employee_key, &reference_id);
         env.storage().persistent().set(&index_key, &employee);
 
-        env.events().publish(
-            (Symbol::new(&env, "ReferenceIdSet"), employee.clone()),
-            (reference_id,),
-        );
+        payroll_events::emit_reference_id_set(&env, employee, reference_id);
     }
 
     /// Get the external reference ID for an employee (if set).
@@ -410,6 +406,9 @@ impl SalaryCommitmentContract {
         env: Env,
         reference_id: soroban_sdk::String,
     ) -> Option<Address> {
+        if reference_id.is_empty() || reference_id.len() > 256 {
+            return None;
+        }
         let key = DataKey::ReferenceIdIndex(reference_id);
         env.storage().persistent().get(&key)
     }
@@ -432,6 +431,7 @@ impl SalaryCommitmentContract {
         };
 
         env.storage().persistent().set(&key, &payment_nullifier);
+        payroll_events::emit_nullifier_recorded(&env, payment_nullifier.nullifier);
     }
 
     /// Check if a nullifier has been used
@@ -510,7 +510,11 @@ impl SalaryCommitmentContract {
         }
         current_admin.require_auth();
 
-        if env.storage().persistent().has(&DataKey::PendingAdminRotation) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingAdminRotation)
+        {
             panic!("A pending admin rotation already exists");
         }
 
@@ -523,10 +527,7 @@ impl SalaryCommitmentContract {
             .persistent()
             .set(&DataKey::PendingAdminRotation, &proposal);
 
-        env.events().publish(
-            (Symbol::new(&env, "AdminRotationProposed"), current_admin),
-            (new_admin,),
-        );
+        payroll_events::emit_commitment_admin_proposed(&env, current_admin, new_admin);
     }
 
     /// Accept a pending admin rotation (step 2 of 2).
@@ -543,17 +544,12 @@ impl SalaryCommitmentContract {
         }
         new_admin.require_auth();
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Admin, &new_admin);
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
         env.storage()
             .persistent()
             .remove(&DataKey::PendingAdminRotation);
 
-        env.events().publish(
-            (Symbol::new(&env, "AdminRotationAccepted"), new_admin),
-            (),
-        );
+        payroll_events::emit_commitment_admin_accepted(&env, new_admin);
     }
 
     /// Cancel a pending admin rotation proposal.
@@ -569,22 +565,25 @@ impl SalaryCommitmentContract {
         }
         current_admin.require_auth();
 
-        if !env.storage().persistent().has(&DataKey::PendingAdminRotation) {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingAdminRotation)
+        {
             panic!("No pending admin rotation to cancel");
         }
         env.storage()
             .persistent()
             .remove(&DataKey::PendingAdminRotation);
 
-        env.events().publish(
-            (Symbol::new(&env, "AdminRotationCancelled"), current_admin),
-            (),
-        );
+        payroll_events::emit_commitment_admin_cancelled(&env, current_admin);
     }
 
     /// Get the pending admin rotation proposal, if any.
     pub fn get_pending_admin_rotation(env: Env) -> Option<PendingRotation> {
-        env.storage().persistent().get(&DataKey::PendingAdminRotation)
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingAdminRotation)
     }
 
     // ── Issue #193: pause support ────────────────────────────────────────────
@@ -595,6 +594,7 @@ impl SalaryCommitmentContract {
         env.storage()
             .persistent()
             .set(&DataKey::PauseManager, &pause_manager);
+        payroll_events::emit_commitment_pause_manager_set(&env, pause_manager);
     }
 
     fn require_not_paused(env: &Env) {
@@ -609,6 +609,16 @@ impl SalaryCommitmentContract {
                 panic!("Salary commitment operations are paused");
             }
         }
+    }
+
+    /// Reject a commitment value that has already been bound to any
+    /// employee (active or archived) and register it as used (issue #242).
+    fn register_commitment_uniqueness(env: &Env, commitment: &BytesN<32>) {
+        let key = DataKey::CommitmentIndex(commitment.clone());
+        if env.storage().persistent().has(&key) {
+            panic!("Commitment already in use: commitments must be unique across employees and payroll runs");
+        }
+        env.storage().persistent().set(&key, &true);
     }
 
     fn archive_commitment(env: &Env, employee: &Address, commitment: &BytesN<32>, version: u32) {
@@ -686,6 +696,67 @@ mod tests {
 
         assert_eq!(result.commitment, updated);
         assert_eq!(result.version, 2);
+    }
+
+    // ── Issue #242: payroll commitment uniqueness enforcement ────────────────
+
+    /// The same commitment value must not be assignable to two different
+    /// employees — reuse would weaken privacy assumptions (two employees
+    /// appearing to share the same salary + blinding factor) and confuse
+    /// reconciliation.
+    #[test]
+    #[should_panic(expected = "Commitment already in use")]
+    fn test_duplicate_commitment_rejected_for_different_employee() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee_a = Address::generate(&env);
+        let employee_b = Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[7u8; 32]);
+
+        client.store_commitment(&employee_a, &commitment);
+        client.store_commitment(&employee_b, &commitment);
+    }
+
+    /// Rotating or updating a commitment to a value already bound to another
+    /// employee must be rejected the same way as `store_commitment`.
+    #[test]
+    #[should_panic(expected = "Commitment already in use")]
+    fn test_update_commitment_rejects_value_already_used_elsewhere() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee_a = Address::generate(&env);
+        let employee_b = Address::generate(&env);
+        let commitment_a = BytesN::from_array(&env, &[8u8; 32]);
+        let commitment_b = BytesN::from_array(&env, &[9u8; 32]);
+
+        client.store_commitment(&employee_a, &commitment_a);
+        client.store_commitment(&employee_b, &commitment_b);
+
+        // Attempt to rotate employee B onto employee A's active commitment.
+        client.update_commitment(&employee_b, &commitment_a);
+    }
+
+    /// A commitment value that was rotated out (archived) can never be
+    /// reused, even by a brand-new employee — it must remain retired for
+    /// the lifetime of the contract (issue #242).
+    #[test]
+    #[should_panic(expected = "Commitment already in use")]
+    fn test_archived_commitment_cannot_be_reused() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee = Address::generate(&env);
+        let new_employee = Address::generate(&env);
+        let old_commitment = BytesN::from_array(&env, &[10u8; 32]);
+        let new_commitment = BytesN::from_array(&env, &[11u8; 32]);
+
+        client.store_commitment(&employee, &old_commitment);
+        client.rotate_commitment(&employee, &new_commitment);
+
+        // old_commitment is now archived/revoked but must remain retired.
+        client.store_commitment(&new_employee, &old_commitment);
     }
 
     #[test]
@@ -972,14 +1043,15 @@ mod tests {
         let existing_emp = Address::generate(&env);
         let new_emp = Address::generate(&env);
         let cmt = BytesN::from_array(&env, &[15u8; 32]);
+        let other_cmt = BytesN::from_array(&env, &[16u8; 32]);
 
         client.store_commitment(&existing_emp, &cmt);
         client.lock_commitment_updates(&existing_emp);
 
-        // A new employee should still be able to get a commitment stored
-        let result = client.store_commitment(&new_emp, &cmt);
+        // A new employee should still be able to get a (distinct) commitment stored
+        let result = client.store_commitment(&new_emp, &other_cmt);
         assert_eq!(result.version, 1);
-        assert_eq!(result.commitment, cmt);
+        assert_eq!(result.commitment, other_cmt);
     }
 
     /// A stranger who is neither the admin nor the delegated operator must

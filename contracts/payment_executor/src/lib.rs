@@ -1,11 +1,14 @@
 #![no_std]
 
+extern crate alloc;
+use alloc::format;
+
 use pause_manager::PauseManagerClient;
 use payroll_registry::{CompanyInfo, PayrollRegistryClient};
 use proof_verifier::{Groth16Proof, ProofVerifierClient};
 use salary_commitment::SalaryCommitmentContractClient;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env,
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Symbol,
 };
 
 /// Maximum age for a proof relative to its period creation time (7 days in seconds).
@@ -62,6 +65,8 @@ pub enum PaymentError {
     PeriodAlreadyExists = 6,
     /// The proof has expired and can no longer be used (issue #77).
     ProofExpired = 7,
+    /// Empty payroll batches are rejected to avoid silent no-op execution.
+    EmptyBatch = 8,
 }
 
 /// Contract addresses for dependencies
@@ -133,7 +138,17 @@ impl PaymentExecutor {
             .persistent()
             .set(&DataKey::AllowedAsset(addresses.token.clone()), &true);
         // Set initial storage key version (issue #174)
-        env.storage().persistent().set(&DataKey::StorageVersion, &1u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::StorageVersion, &1u32);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "TreasuryAssetAllowedUpdated"),
+                addresses.token.clone(),
+            ),
+            (true, env.ledger().timestamp()),
+        );
     }
 
     /// Set the executor-level admin (one-time, protected by auth).
@@ -145,6 +160,7 @@ impl PaymentExecutor {
         env.storage()
             .persistent()
             .set(&DataKey::ExecutorAdmin, &admin);
+        payroll_events::emit_executor_admin_set(&env, admin);
     }
 
     /// Set the pause manager contract address (only executor admin).
@@ -158,6 +174,7 @@ impl PaymentExecutor {
         env.storage()
             .persistent()
             .set(&DataKey::PauseManager, &pause_manager);
+        payroll_events::emit_executor_pause_manager_set(&env, pause_manager);
     }
 
     /// Allow or disallow an asset token for payment execution (only executor admin - issue #175).
@@ -170,7 +187,12 @@ impl PaymentExecutor {
         admin.require_auth();
         env.storage()
             .persistent()
-            .set(&DataKey::AllowedAsset(asset), &allowed);
+            .set(&DataKey::AllowedAsset(asset.clone()), &allowed);
+
+        env.events().publish(
+            (Symbol::new(&env, "TreasuryAssetAllowedUpdated"), asset),
+            (allowed, env.ledger().timestamp()),
+        );
     }
 
     /// Check if an asset token is allowlisted for payments (issue #175).
@@ -219,6 +241,19 @@ impl PaymentExecutor {
             return Err(PaymentError::PeriodAlreadyExists);
         }
 
+        if next_id > 1 {
+            let prev_key = DataKey::Period(company_id, next_id - 1);
+            if let Some(prev_period) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, PayrollPeriod>(&prev_key)
+            {
+                if !prev_period.closed {
+                    return Err(PaymentError::PeriodAlreadyExists);
+                }
+            }
+        }
+
         let period = PayrollPeriod {
             period_id: next_id,
             company_id,
@@ -232,10 +267,7 @@ impl PaymentExecutor {
         env.storage().persistent().set(&period_key, &period);
         env.storage().persistent().set(&seq_key, &(next_id + 1));
 
-        env.events().publish(
-            (soroban_sdk::Symbol::new(&env, "PeriodCreated"), company_id),
-            (next_id,),
-        );
+        payroll_events::emit_period_created(&env, company_id, next_id);
 
         Ok(period)
     }
@@ -272,10 +304,7 @@ impl PaymentExecutor {
         period.end_ledger = env.ledger().sequence();
         env.storage().persistent().set(&period_key, &period);
 
-        env.events().publish(
-            (soroban_sdk::Symbol::new(&env, "PeriodClosed"), company_id),
-            (period_id,),
-        );
+        payroll_events::emit_period_closed(&env, company_id, period_id);
 
         Ok(period)
     }
@@ -360,8 +389,9 @@ impl PaymentExecutor {
         let registry = PayrollRegistryClient::new(&env, &addresses.registry);
         let company: CompanyInfo = registry.get_company(&company_id);
 
-        // Ensure only HR admin for this company can trigger payroll.
+        // Ensure only HR admin for this company can trigger payroll and treasury authorizes payment.
         company.admin.require_auth();
+        company.treasury.require_auth();
 
         // Construct public inputs required by issue #20:
         let mut public_inputs = soroban_sdk::Vec::new(&env);
@@ -390,9 +420,9 @@ impl PaymentExecutor {
         if token_str.is_empty() {
             panic!("Invalid treasury asset mapping: empty token address");
         }
-        
+
         // Verify the treasury address is properly configured and matches asset type
-        let treasury_str = format!("{:?}", addresses.treasury);
+        let treasury_str = format!("{:?}", company.treasury);
         if treasury_str.is_empty() {
             panic!("Invalid treasury mapping: empty treasury address");
         }
@@ -413,6 +443,17 @@ impl PaymentExecutor {
         env.storage().persistent().set(&payment_key, &record);
         env.storage().persistent().set(&nullifier_key, &true);
 
+        // Increment period payment count
+        let period_key = DataKey::Period(company_id, period);
+        if let Some(mut period_struct) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PayrollPeriod>(&period_key)
+        {
+            period_struct.payment_count += 1;
+            env.storage().persistent().set(&period_key, &period_struct);
+        }
+
         // Update total paid
         let total_key = DataKey::TotalPaid(company_id);
         let current_total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
@@ -421,15 +462,7 @@ impl PaymentExecutor {
             .set(&total_key, &(current_total + amount));
 
         // Emit PayrollProcessed event so off-chain indexers can reconcile payments.
-        env.events().publish(
-            (
-                soroban_sdk::Symbol::new(&env, "PayrollProcessed"),
-                company_id,
-            ),
-            (employee, amount, period),
-        );
-        // topics : ("PayrollProcessed", company_id)
-        // data   : (employee, amount, period)
+        payroll_events::emit_executor_payment_processed(&env, company_id, employee, amount, period);
 
         let _ = nullifier;
 
@@ -458,6 +491,10 @@ impl PaymentExecutor {
             || nullifiers.len() != count
         {
             return Err(PaymentError::ArrayLengthMismatch);
+        }
+
+        if count == 0 {
+            return Err(PaymentError::EmptyBatch);
         }
 
         let mut records = soroban_sdk::Vec::new(&env);
@@ -504,6 +541,30 @@ impl PaymentExecutor {
     /// Get the maximum allowed age for a proof in seconds (issue #77).
     pub fn get_max_proof_age(_env: Env) -> u64 {
         MAX_PROOF_AGE_SECONDS
+    }
+
+    /// Get the contract dependency addresses configured during initialization.
+    pub fn get_addresses(env: Env) -> ContractAddresses {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized")
+    }
+
+    /// Get the executor admin address.
+    pub fn get_executor_admin(env: Env) -> Address {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ExecutorAdmin)
+            .expect("Executor admin not set")
+    }
+
+    /// Get the current period sequence for a company (defaults to 0).
+    pub fn get_period_sequence(env: Env, company_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PeriodSequence(company_id))
+            .unwrap_or(0u32)
     }
 }
 
@@ -631,8 +692,8 @@ mod tests {
         assert_eq!(token_client.balance(&employee), 1_000);
 
         let events = env.events().all();
-        assert_eq!(events.len(), 5);
-        let event = events.get(4).unwrap();
+        assert_eq!(events.len(), 6);
+        let event = events.get(events.len() - 1).unwrap();
         assert_eq!(event.1.len(), 2);
         let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
         assert_eq!(sym0, Symbol::new(&env, "PayrollProcessed"));
@@ -762,6 +823,30 @@ mod tests {
         assert_eq!(result.company_id, company_id);
         assert!(!result.closed);
         assert_eq!(result.payment_count, 0);
+    }
+
+    #[test]
+    fn test_duplicate_period_creation_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, PaymentExecutor);
+        let client = PaymentExecutorClient::new(&env, &contract_id);
+
+        let addresses = setup_addresses(&env);
+        client.initialize(&addresses);
+
+        let registry_client = PayrollRegistryClient::new(&env, &addresses.registry);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let company_id = registry_client.register_company(&admin, &treasury);
+
+        let _ = client.create_period(&company_id);
+
+        let result = client.try_create_period(&company_id);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            PaymentError::PeriodAlreadyExists
+        );
     }
 
     #[test]
@@ -919,8 +1004,8 @@ mod tests {
         assert_eq!(client.get_total_paid(&company_id), 2_500);
 
         let events = env.events().all();
-        assert_eq!(events.len(), 5);
-        let event = events.get(4).unwrap();
+        assert_eq!(events.len(), 6);
+        let event = events.get(events.len() - 1).unwrap();
         assert_eq!(event.1.len(), 2);
         let sym: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
         assert_eq!(sym, Symbol::new(&env, "PayrollProcessed"));
@@ -1327,5 +1412,160 @@ mod tests {
         client.initialize(&addresses);
 
         assert_eq!(client.get_storage_version(), 1);
+    }
+
+    #[test]
+    fn test_asset_allowed_emits_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, PaymentExecutor);
+        let client = PaymentExecutorClient::new(&env, &contract_id);
+
+        let addresses = setup_addresses(&env);
+        let before_init = env.events().all().len();
+        client.initialize(&addresses);
+        let after_init = env.events().all().len();
+        assert_eq!(after_init, before_init + 1);
+
+        let init_event = env.events().all().get(after_init - 1).unwrap();
+        let sym0: Symbol = init_event
+            .1
+            .get(0)
+            .unwrap()
+            .try_into_val(&env.clone())
+            .unwrap();
+        assert_eq!(sym0, Symbol::new(&env, "TreasuryAssetAllowedUpdated"));
+
+        let executor_admin = Address::generate(&env);
+        client.set_executor_admin(&executor_admin);
+
+        let before_set = env.events().all().len();
+        let new_asset = Address::generate(&env);
+        client.set_asset_allowed(&new_asset, &true);
+        let after_set = env.events().all().len();
+        assert_eq!(after_set, before_set + 1);
+
+        let set_event = env.events().all().get(after_set - 1).unwrap();
+        let set_sym0: Symbol = set_event
+            .1
+            .get(0)
+            .unwrap()
+            .try_into_val(&env.clone())
+            .unwrap();
+        assert_eq!(set_sym0, Symbol::new(&env, "TreasuryAssetAllowedUpdated"));
+    }
+
+    // ── Issue #245: operator vs admin role separation ─────────────────────────
+    //
+    // `payment_executor` has two distinct privileged roles that must not be
+    // conflated: the protocol-level `ExecutorAdmin` (gates contract-wide
+    // config: `set_asset_allowed`, `set_pause_manager`) and each company's
+    // own `admin` (gates that company's periods and payments only — the
+    // "operator" of its own payroll). Neither role should be able to
+    // exercise the other's capabilities.
+
+    /// A company admin (this company's payroll "operator") must not be able
+    /// to exercise the protocol-level `ExecutorAdmin` capability of changing
+    /// the treasury asset allowlist just because they administer a company.
+    #[test]
+    #[should_panic(expected = "authorized")]
+    fn test_company_admin_cannot_set_asset_allowed() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PaymentExecutor);
+        let client = PaymentExecutorClient::new(&env, &contract_id);
+
+        let addresses = setup_addresses(&env);
+        client.initialize(&addresses);
+
+        let executor_admin = Address::generate(&env);
+        client.set_executor_admin(&executor_admin);
+
+        let registry_client = PayrollRegistryClient::new(&env, &addresses.registry);
+        let company_admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let _company_id = registry_client.register_company(&company_admin, &treasury);
+
+        // Company admin (not the executor admin) attempts a protocol-level
+        // config change.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &company_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_asset_allowed",
+                args: (addresses.token.clone(), false).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_asset_allowed(&addresses.token, &false);
+    }
+
+    /// The protocol-level `ExecutorAdmin` must not be able to trigger payroll
+    /// execution for a company it does not administer — that capability
+    /// belongs solely to the company's own admin.
+    #[test]
+    #[should_panic(expected = "authorized")]
+    fn test_executor_admin_cannot_execute_payment_for_foreign_company() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PaymentExecutor);
+        let client = PaymentExecutorClient::new(&env, &contract_id);
+
+        let addresses = setup_addresses(&env);
+        client.initialize(&addresses);
+
+        let executor_admin = Address::generate(&env);
+        client.set_executor_admin(&executor_admin);
+
+        let registry_client = PayrollRegistryClient::new(&env, &addresses.registry);
+        let commitment_client = SalaryCommitmentContractClient::new(&env, &addresses.commitment);
+        let token_client = TokenClient::new(&env, &addresses.token);
+
+        let company_admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let company_id = registry_client.register_company(&company_admin, &treasury);
+
+        let employee = Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[5u8; 32]);
+        commitment_client.store_commitment(&employee, &commitment);
+        registry_client.add_employee(&company_id, &employee, &commitment);
+        token_client.mint(&treasury, &100_000i128);
+
+        client.create_period(&company_id);
+
+        let proof_a = BytesN::from_array(&env, &[1u8; 64]);
+        let proof_b = BytesN::from_array(&env, &[2u8; 128]);
+        let proof_c = BytesN::from_array(&env, &[3u8; 64]);
+        let nullifier = BytesN::from_array(&env, &[4u8; 32]);
+
+        // Executor admin (not this company's admin) attempts to execute a
+        // payment for a company it does not administer.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &executor_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "execute_payment",
+                args: (
+                    company_id,
+                    employee.clone(),
+                    1000i128,
+                    proof_a.clone(),
+                    proof_b.clone(),
+                    proof_c.clone(),
+                    nullifier.clone(),
+                    1u32,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let _ = client.execute_payment(
+            &company_id,
+            &employee,
+            &1000i128,
+            &proof_a,
+            &proof_b,
+            &proof_c,
+            &nullifier,
+            &1u32,
+        );
     }
 }

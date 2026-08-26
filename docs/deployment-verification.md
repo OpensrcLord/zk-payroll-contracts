@@ -21,14 +21,17 @@ All commands use the unified **`stellar`** CLI (the `soroban` CLI is
 equivalent — `soroban contract …` accepts the same subcommands where noted).
 Replace every `<ALL_CAPS>` placeholder with your real value before running.
 
-The five contracts and their release WASM artifacts:
+The seven contracts and their release WASM artifacts, in deployment order (see
+[ops/preflight-deployment-checklist.md §5](ops/preflight-deployment-checklist.md#5-deployment-order)):
 
 | Contract | Struct | WASM artifact |
 |----------|--------|---------------|
 | `payroll_registry` | `PayrollRegistry` | `payroll_registry.wasm` |
 | `salary_commitment` | `SalaryCommitmentContract` | `salary_commitment.wasm` |
 | `proof_verifier` | `ProofVerifier` | `proof_verifier.wasm` |
+| `pause_manager` | `PauseManager` | `pause_manager.wasm` |
 | `payment_executor` | `PaymentExecutor` | `payment_executor.wasm` |
+| `payroll` | `Payroll` | `payroll.wasm` |
 | `audit_module` | `AuditModule` | `audit_module.wasm` |
 
 ---
@@ -67,7 +70,7 @@ export SOURCE=admin
 - [ ] Contract-ID variables, exported as each contract is deployed:
 
 ```bash
-export TOKEN_ID=<TOKEN_CONTRACT_ID> REGISTRY_ID=<REGISTRY_CONTRACT_ID> COMMITMENT_ID=<COMMITMENT_CONTRACT_ID> VERIFIER_ID=<VERIFIER_CONTRACT_ID> EXECUTOR_ID=<EXECUTOR_CONTRACT_ID> AUDIT_ID=<AUDIT_CONTRACT_ID>
+export TOKEN_ID=<TOKEN_CONTRACT_ID> REGISTRY_ID=<REGISTRY_CONTRACT_ID> COMMITMENT_ID=<COMMITMENT_CONTRACT_ID> VERIFIER_ID=<VERIFIER_CONTRACT_ID> PAUSE_ID=<PAUSE_MANAGER_CONTRACT_ID> EXECUTOR_ID=<EXECUTOR_CONTRACT_ID> PAYROLL_ID=<PAYROLL_CONTRACT_ID> AUDIT_ID=<AUDIT_CONTRACT_ID>
 ```
 
 ### Network config verification
@@ -128,9 +131,9 @@ stellar keys address $SOURCE
 
 ## 2. Contract Deployment Verification
 
-Run these for **each of the five contracts**. Repeat the block substituting the
+Run these for **each of the seven contracts**. Repeat the block substituting the
 matching contract-ID variable (`$REGISTRY_ID`, `$COMMITMENT_ID`,
-`$VERIFIER_ID`, `$EXECUTOR_ID`, `$AUDIT_ID`).
+`$VERIFIER_ID`, `$PAUSE_ID`, `$EXECUTOR_ID`, `$PAYROLL_ID`, `$AUDIT_ID`).
 
 ### 2.1 Confirm the contract was deployed
 
@@ -155,10 +158,22 @@ stellar contract fetch --id $COMMITMENT_ID --network $NETWORK --out-file /tmp/fe
 stellar contract fetch --id $VERIFIER_ID --network $NETWORK --out-file /tmp/fetched_verifier.wasm
 ```
 
+- [ ] `pause_manager` deployed:
+
+```bash
+stellar contract fetch --id $PAUSE_ID --network $NETWORK --out-file /tmp/fetched_pause_manager.wasm
+```
+
 - [ ] `payment_executor` deployed:
 
 ```bash
 stellar contract fetch --id $EXECUTOR_ID --network $NETWORK --out-file /tmp/fetched_executor.wasm
+```
+
+- [ ] `payroll` deployed:
+
+```bash
+stellar contract fetch --id $PAYROLL_ID --network $NETWORK --out-file /tmp/fetched_payroll.wasm
 ```
 
 - [ ] `audit_module` deployed:
@@ -223,6 +238,21 @@ stellar contract invoke --id $EXECUTOR_ID --source $SOURCE --network $NETWORK --
 
 **Expected output:** `true` (the token passed into `initialize` is
 auto-allowlisted).
+
+- [ ] **`pause_manager`** — `initialize(operator)` has been called exactly
+  once (panics `Already initialized` on repeat). Confirm via `is_paused`:
+
+```bash
+stellar contract invoke --id $PAUSE_ID --source $SOURCE --network $NETWORK -- is_paused
+```
+
+**Expected output:** `false` on a fresh deploy.
+
+- [ ] **`payroll`** — `initialize(admin, token, verifier, commitment, treasury,
+  treasury_owner)` has been called (panics `Already initialized` on repeat)
+  and the run counter starts at `0`. `set_pause_manager(pause_manager)` has
+  been wired if pausability is required. Confirm via the indirect admin check
+  in §3.6 (there is no `get_addresses` getter).
 
 - [ ] **`audit_module`** — has no admin-init entrypoint; the view-key granter is
   the contract's own address. State begins empty (`get_audit_log_count`
@@ -302,6 +332,44 @@ stellar contract invoke --id $AUDIT_ID --source $SOURCE --network $NETWORK -- ge
 ```
 
 **Expected output:** `0` on a fresh deploy.
+
+### 3.6 `payroll` admin
+
+`payroll` stores its `ContractAddresses` (including `admin`) but exposes
+**no getter**. Verify indirectly, the same way as §3.3:
+
+- [ ] Confirm an admin-gated call succeeds only for the real admin — invoking
+  `commit_draft` as `$SOURCE` should succeed if `$SOURCE` is the payroll admin,
+  and fail with an authorization error otherwise:
+
+```bash
+stellar contract invoke --id $PAYROLL_ID --source $SOURCE --network $NETWORK -- commit_draft --admin $(stellar keys address $SOURCE) --draft_hash 0000000000000000000000000000000000000000000000000000000000000000
+```
+
+**Expected output:** succeeds when `$SOURCE` is the payroll admin; an
+authorization error confirms `$SOURCE` is not admin.
+
+### 3.7 `pause_manager` operator
+
+`pause_manager` stores the operator address but exposes no getter for it
+either. Do **not** invoke `pause` / `unpause` against a live deployment just to
+test authorization — that would actually pause the system. Instead confirm the
+operator indirectly via a reversible call:
+
+- [ ] Propose (and then cancel) an operator rotation as `$SOURCE` — this
+  requires the caller to already be the current operator and has no
+  side effect on the paused/unpaused state:
+
+```bash
+stellar contract invoke --id $PAUSE_ID --source $SOURCE --network $NETWORK -- propose_operator_rotation --current_operator $(stellar keys address $SOURCE) --new_operator $(stellar keys address $SOURCE)
+```
+
+```bash
+stellar contract invoke --id $PAUSE_ID --source $SOURCE --network $NETWORK -- cancel_operator_rotation --current_operator $(stellar keys address $SOURCE)
+```
+
+**Expected output:** both calls succeed when `$SOURCE` is the operator; an
+authorization error on the first call confirms `$SOURCE` is not the operator.
 
 ---
 
@@ -440,6 +508,20 @@ window.)
   `PayrollProcessed` event and balance movement. This is beyond a basic smoke
   test — see [sdk-contract-interface.md](sdk-contract-interface.md) Flow 3.
 
+- [ ] **(Optional) `payroll` batch path wiring.** If the deployment also uses
+  the nonce-based `payroll` contract (a separate execution path from
+  `payment_executor`), confirm `salary_commitment`'s delegated operator is the
+  `payroll` contract address:
+
+```bash
+stellar contract invoke --id $COMMITMENT_ID --source $SOURCE --network $NETWORK -- get_payroll_operator
+```
+
+**Expected output:** `"$PAYROLL_ID"`. A mismatch means `set_payroll_operator`
+was not called against `payroll`'s deployed address (see preflight checklist
+step 8), and `payroll`'s `batch_process_payroll` will fail to record
+nullifiers or lock commitments.
+
 ---
 
 ## 6. Rollback Procedure
@@ -459,8 +541,8 @@ stellar contract invoke --id $EXECUTOR_ID --source $SOURCE --network $NETWORK --
 ```
 
   Then trigger the pause on the pause manager itself (see the pause manager's
-  own interface). The registry, salary_commitment, and audit_module each also
-  expose `set_pause_manager` for the same purpose.
+  own interface). The registry, salary_commitment, payroll, and audit_module
+  each also expose `set_pause_manager` for the same purpose.
 - [ ] **Capture diagnostics:** record the failing command, the contract ID,
   and the full error/panic message for the incident log (see
   [incident-response-playbook.md](incident-response-playbook.md)).

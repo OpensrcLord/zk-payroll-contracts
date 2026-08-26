@@ -1,7 +1,13 @@
 #![no_std]
 
+extern crate alloc;
+
 use pause_manager::PauseManagerClient;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Symbol};
+
+const STELLAR_ACCOUNT_STRKEY_LEN: u32 = 56;
+const STELLAR_ACCOUNT_STRKEY_LEN_USIZE: usize = 56;
+const STELLAR_ACCOUNT_VERSION_BYTE: u8 = 6 << 3;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -87,6 +93,18 @@ pub trait PayrollRegistryTrait {
     /// The employee's initial status is set to `Active`.
     fn add_employee(env: Env, company_id: u64, employee: Address, commitment: BytesN<32>);
 
+    /// Validate a canonical Stellar account wallet string for employee onboarding.
+    fn validate_employee_wallet_format(env: Env, employee_wallet: String) -> bool;
+
+    /// Add an employee commitment from a Stellar account wallet string.
+    /// Requires authorisation from the company admin.
+    fn add_employee_by_wallet(
+        env: Env,
+        company_id: u64,
+        employee_wallet: String,
+        commitment: BytesN<32>,
+    );
+
     /// Permanently remove an employee record from storage.
     /// Requires authorisation from the company admin.
     fn remove_employee(env: Env, company_id: u64, employee: Address);
@@ -140,6 +158,18 @@ pub trait PayrollRegistryTrait {
 
     /// Accept a pending treasury rotation (step 2 of 2).
     fn accept_treasury_rotation(env: Env, company_id: u64, new_treasury: Address);
+
+    /// Cancel a pending treasury rotation.
+    fn cancel_treasury_rotation(env: Env, company_id: u64, current_admin: Address);
+
+    /// Return the current company sequence counter (defaults to 0).
+    fn get_company_sequence(env: Env) -> u64;
+
+    /// Return any pending admin rotation proposal for a company.
+    fn get_pending_admin_rotation(env: Env, company_id: u64) -> Option<PendingCompanyRotation>;
+
+    /// Return any pending treasury rotation proposal for a company.
+    fn get_pending_treasury_rotation(env: Env, company_id: u64) -> Option<PendingCompanyRotation>;
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +200,121 @@ impl PayrollRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::PauseManager, &pause_manager);
+        payroll_events::emit_registry_pause_manager_set(&env, pause_manager);
+    }
+
+    fn add_employee_record(env: Env, company_id: u64, employee: Address, commitment: BytesN<32>) {
+        Self::require_not_paused(&env);
+        let info: CompanyInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Company(company_id))
+            .expect("Company not found");
+
+        info.admin.require_auth();
+
+        let emp = employee.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Employee(company_id, emp.clone()), &commitment);
+
+        // Default status for newly registered employees is Active (issue #90).
+        env.storage().persistent().set(
+            &DataKey::EmpStatus(company_id, emp),
+            &EmployeeStatus::Active,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "EmployeeAdded"), company_id, employee),
+            (commitment,),
+        );
+        // topics : ("EmployeeAdded", company_id, employee)
+        // data   : (commitment,)
+    }
+
+    fn require_valid_employee_wallet_format(employee_wallet: &String) {
+        if !Self::employee_wallet_format_is_valid(employee_wallet) {
+            panic!("Invalid employee wallet address format");
+        }
+    }
+
+    fn employee_wallet_format_is_valid(employee_wallet: &String) -> bool {
+        if employee_wallet.len() != STELLAR_ACCOUNT_STRKEY_LEN {
+            return false;
+        }
+
+        let mut encoded = [0u8; STELLAR_ACCOUNT_STRKEY_LEN_USIZE];
+        employee_wallet.copy_into_slice(&mut encoded);
+
+        let mut decoded = [0u8; 35];
+        if !Self::decode_stellar_base32(&encoded, &mut decoded) {
+            return false;
+        }
+
+        if decoded[0] != STELLAR_ACCOUNT_VERSION_BYTE {
+            return false;
+        }
+
+        let expected_checksum = u16::from_le_bytes([decoded[33], decoded[34]]);
+        let actual_checksum = Self::crc16_xmodem(&decoded[..33]);
+        expected_checksum == actual_checksum
+    }
+
+    fn decode_stellar_base32(
+        encoded: &[u8; STELLAR_ACCOUNT_STRKEY_LEN_USIZE],
+        decoded: &mut [u8; 35],
+    ) -> bool {
+        let mut buffer: u16 = 0;
+        let mut bits_left: u8 = 0;
+        let mut out_index: usize = 0;
+
+        for ch in encoded {
+            let Some(value) = Self::decode_base32_char(*ch) else {
+                return false;
+            };
+            buffer = (buffer << 5) | u16::from(value);
+            bits_left += 5;
+
+            if bits_left >= 8 {
+                bits_left -= 8;
+                if out_index >= decoded.len() {
+                    return false;
+                }
+                decoded[out_index] = (buffer >> bits_left) as u8;
+                out_index += 1;
+
+                if bits_left > 0 {
+                    buffer &= (1u16 << bits_left) - 1;
+                } else {
+                    buffer = 0;
+                }
+            }
+        }
+
+        out_index == decoded.len() && bits_left == 0
+    }
+
+    fn decode_base32_char(ch: u8) -> Option<u8> {
+        match ch {
+            b'A'..=b'Z' => Some(ch - b'A'),
+            b'2'..=b'7' => Some(ch - b'2' + 26),
+            _ => None,
+        }
+    }
+
+    fn crc16_xmodem(bytes: &[u8]) -> u16 {
+        let mut crc: u16 = 0;
+        for byte in bytes {
+            crc ^= u16::from(*byte) << 8;
+            for _ in 0..8 {
+                if (crc & 0x8000) != 0 {
+                    crc = (crc << 1) ^ 0x1021;
+                } else {
+                    crc <<= 1;
+                }
+            }
+        }
+        crc
     }
 }
 
@@ -207,50 +352,28 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .persistent()
             .set(&DataKey::CompanyAdmin(admin.clone()), &id);
 
-        env.events().publish(
-            (Symbol::new(&env, "CompanyRegistered"), id),
-            (admin, treasury),
-        );
-        // topics : ("CompanyRegistered", company_id)
-        // data   : (admin, treasury)
+        payroll_events::emit_company_registered(&env, id, admin, treasury);
 
         id
     }
 
     fn add_employee(env: Env, company_id: u64, employee: Address, commitment: BytesN<32>) {
-        Self::require_not_paused(&env);
-        let info: CompanyInfo = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Company(company_id))
-            .expect("Company not found");
+        Self::add_employee_record(env, company_id, employee, commitment);
+    }
 
-        info.admin.require_auth();
+    fn validate_employee_wallet_format(_env: Env, employee_wallet: String) -> bool {
+        Self::employee_wallet_format_is_valid(&employee_wallet)
+    }
 
-        // Issue #220: Validate employee wallet format before accepting into state
-        // Ensure employee address is valid (Soroban validates this implicitly,
-        // but we explicitly check for zero-length to catch invalid formats early)
-        let emp = employee.clone();
-        let emp_str = format!("{:?}", emp);
-        if emp_str.is_empty() {
-            panic!("Invalid employee wallet address format");
-        }
-        env.storage()
-            .persistent()
-            .set(&DataKey::Employee(company_id, emp.clone()), &commitment);
-
-        // Default status for newly registered employees is Active (issue #90).
-        env.storage().persistent().set(
-            &DataKey::EmpStatus(company_id, emp),
-            &EmployeeStatus::Active,
-        );
-
-        env.events().publish(
-            (Symbol::new(&env, "EmployeeAdded"), company_id, employee),
-            (commitment,),
-        );
-        // topics : ("EmployeeAdded", company_id, employee)
-        // data   : (commitment,)
+    fn add_employee_by_wallet(
+        env: Env,
+        company_id: u64,
+        employee_wallet: String,
+        commitment: BytesN<32>,
+    ) {
+        Self::require_valid_employee_wallet_format(&employee_wallet);
+        let employee = Address::from_string(&employee_wallet);
+        Self::add_employee_record(env, company_id, employee, commitment);
     }
 
     fn remove_employee(env: Env, company_id: u64, employee: Address) {
@@ -268,12 +391,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .persistent()
             .remove(&DataKey::Employee(company_id, emp));
 
-        env.events().publish(
-            (Symbol::new(&env, "EmployeeRemoved"), company_id, employee),
-            (),
-        );
-        // topics : ("EmployeeRemoved", company_id, employee)
-        // data   : ()
+        payroll_events::emit_employee_removed(&env, company_id, employee);
     }
 
     fn update_commitment(env: Env, company_id: u64, employee: Address, new_commitment: BytesN<32>) {
@@ -294,12 +412,12 @@ impl PayrollRegistryTrait for PayrollRegistry {
 
         env.storage().persistent().set(&key, &new_commitment);
 
-        env.events().publish(
-            (Symbol::new(&env, "CommitmentUpdated"), company_id, employee),
-            (new_commitment,),
+        payroll_events::emit_registry_commitment_updated(
+            &env,
+            company_id,
+            employee,
+            new_commitment,
         );
-        // topics : ("CommitmentUpdated", company_id, employee)
-        // data   : (new_commitment,)
     }
 
     fn get_company(env: Env, company_id: u64) -> CompanyInfo {
@@ -418,13 +536,14 @@ impl PayrollRegistryTrait for PayrollRegistry {
         }
 
         let proposal = PendingCompanyRotation {
-            new_holder: new_admin,
-            proposed_by: current_admin,
+            new_holder: new_admin.clone(),
+            proposed_by: current_admin.clone(),
             proposed_at: env.ledger().timestamp(),
         };
         env.storage()
             .persistent()
             .set(&DataKey::PendingAdminRotation(company_id), &proposal);
+        payroll_events::emit_company_admin_proposed(&env, company_id, current_admin, new_admin);
     }
 
     fn accept_admin_rotation(env: Env, company_id: u64, new_admin: Address) {
@@ -457,10 +576,11 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .remove(&DataKey::PendingAdminRotation(company_id));
         env.storage()
             .persistent()
-            .remove(&DataKey::CompanyAdmin(old_admin));
+            .remove(&DataKey::CompanyAdmin(old_admin.clone()));
         env.storage()
             .persistent()
-            .set(&DataKey::CompanyAdmin(new_admin), &company_id);
+            .set(&DataKey::CompanyAdmin(new_admin.clone()), &company_id);
+        payroll_events::emit_company_admin_rotated(&env, company_id, old_admin, new_admin);
     }
 
     fn cancel_admin_rotation(env: Env, company_id: u64, current_admin: Address) {
@@ -485,6 +605,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
         env.storage()
             .persistent()
             .remove(&DataKey::PendingAdminRotation(company_id));
+        payroll_events::emit_company_admin_rotation_cancelled(&env, company_id, current_admin);
     }
 
     fn propose_treasury_rotation(
@@ -513,13 +634,18 @@ impl PayrollRegistryTrait for PayrollRegistry {
         }
 
         let proposal = PendingCompanyRotation {
-            new_holder: new_treasury,
-            proposed_by: current_admin,
+            new_holder: new_treasury.clone(),
+            proposed_by: current_admin.clone(),
             proposed_at: env.ledger().timestamp(),
         };
         env.storage()
             .persistent()
             .set(&DataKey::PendingTreasuryRotation(company_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "TreasuryRotationProposed"), company_id),
+            (current_admin, new_treasury, env.ledger().timestamp()),
+        );
     }
 
     fn accept_treasury_rotation(env: Env, company_id: u64, new_treasury: Address) {
@@ -541,13 +667,68 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .get(&DataKey::Company(company_id))
             .expect("Company not found");
 
-        info.treasury = new_treasury;
+        let old_treasury = info.treasury.clone();
+
+        info.treasury = new_treasury.clone();
         env.storage()
             .persistent()
             .set(&DataKey::Company(company_id), &info);
         env.storage()
             .persistent()
             .remove(&DataKey::PendingTreasuryRotation(company_id));
+
+        env.events().publish(
+            (Symbol::new(&env, "TreasuryRotated"), company_id),
+            (old_treasury, new_treasury),
+        );
+    }
+
+    fn cancel_treasury_rotation(env: Env, company_id: u64, current_admin: Address) {
+        Self::require_not_paused(&env);
+        let info: CompanyInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Company(company_id))
+            .expect("Company not found");
+        if current_admin != info.admin {
+            panic!("Unauthorized");
+        }
+        current_admin.require_auth();
+
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingTreasuryRotation(company_id))
+        {
+            panic!("No pending treasury rotation to cancel");
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingTreasuryRotation(company_id));
+
+        env.events().publish(
+            (Symbol::new(&env, "TreasuryRotationCancelled"), company_id),
+            (current_admin,),
+        );
+    }
+
+    fn get_company_sequence(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompanySequence)
+            .unwrap_or(0u64)
+    }
+
+    fn get_pending_admin_rotation(env: Env, company_id: u64) -> Option<PendingCompanyRotation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingAdminRotation(company_id))
+    }
+
+    fn get_pending_treasury_rotation(env: Env, company_id: u64) -> Option<PendingCompanyRotation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingTreasuryRotation(company_id))
     }
 }
 

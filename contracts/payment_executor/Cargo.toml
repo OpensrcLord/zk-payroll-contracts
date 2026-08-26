@@ -11,6 +11,7 @@ doctest = false
 [dependencies]
 soroban-sdk = { workspace = true }
 soroban-token-sdk = { workspace = true }
+payroll_events = { path = "../events" }
 payroll_registry = { path = "../payroll_registry" }
 proof_verifier = { path = "../proof_verifier" }
 pause_manager = { path = "../pause_manager" }
