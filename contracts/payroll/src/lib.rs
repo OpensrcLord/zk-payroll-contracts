@@ -389,6 +389,36 @@ impl Payroll {
             .expect("Run not found")
     }
 
+    /// Return `true` if the payroll batch identified by `run_id` has been
+    /// fully settled.
+    ///
+    /// A batch is considered settled once `batch_process_payroll` completed
+    /// without panic: both the `PayrollRun` record **and** the
+    /// `SettledBatch(run_id)` marker are written atomically at that point.
+    ///
+    /// This is a read-only confirmation endpoint — it never mutates state and
+    /// is safe to call any number of times, including during retry flows.
+    ///
+    /// # Returns
+    ///
+    /// * `true`  — the batch reached finalization; funds have been disbursed.
+    /// * `false` — no completed run exists for `run_id`.
+    pub fn is_settled(e: Env, run_id: u64) -> bool {
+        e.storage()
+            .persistent()
+            .has(&DataKey::SettledBatch(run_id))
+    }
+
+    /// Return the ledger timestamp at which `run_id` was settled, or `None`
+    /// if the batch has not yet completed settlement.
+    ///
+    /// Like `is_settled`, this is purely read-only and idempotent.
+    pub fn get_settled_at(e: Env, run_id: u64) -> Option<u64> {
+        e.storage()
+            .persistent()
+            .get(&DataKey::SettledBatch(run_id))
+    }
+
     /// Pre-commit an off-chain metadata hash (SHA-256 of payroll period,
     /// company ID, employee batch hash, and commitment references) that
     /// will be bound to a payroll run during execution (#177).
