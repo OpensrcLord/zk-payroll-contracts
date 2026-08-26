@@ -389,8 +389,9 @@ impl PaymentExecutor {
         let registry = PayrollRegistryClient::new(&env, &addresses.registry);
         let company: CompanyInfo = registry.get_company(&company_id);
 
-        // Ensure only HR admin for this company can trigger payroll.
+        // Ensure only HR admin for this company can trigger payroll and treasury authorizes payment.
         company.admin.require_auth();
+        company.treasury.require_auth();
 
         // Construct public inputs required by issue #20:
         let mut public_inputs = soroban_sdk::Vec::new(&env);
@@ -442,10 +443,16 @@ impl PaymentExecutor {
         env.storage().persistent().set(&payment_key, &record);
         env.storage().persistent().set(&nullifier_key, &true);
 
-        // Update period payment count
-        let mut updated_period = period_record;
-        updated_period.payment_count = updated_period.payment_count.saturating_add(1);
-        env.storage().persistent().set(&period_key, &updated_period);
+        // Increment period payment count
+        let period_key = DataKey::Period(company_id, period);
+        if let Some(mut period_struct) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PayrollPeriod>(&period_key)
+        {
+            period_struct.payment_count += 1;
+            env.storage().persistent().set(&period_key, &period_struct);
+        }
 
         // Update total paid
         let total_key = DataKey::TotalPaid(company_id);
@@ -535,6 +542,30 @@ impl PaymentExecutor {
     pub fn get_max_proof_age(_env: Env) -> u64 {
         MAX_PROOF_AGE_SECONDS
     }
+
+    /// Get the contract dependency addresses configured during initialization.
+    pub fn get_addresses(env: Env) -> ContractAddresses {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized")
+    }
+
+    /// Get the executor admin address.
+    pub fn get_executor_admin(env: Env) -> Address {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ExecutorAdmin)
+            .expect("Executor admin not set")
+    }
+
+    /// Get the current period sequence for a company (defaults to 0).
+    pub fn get_period_sequence(env: Env, company_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PeriodSequence(company_id))
+            .unwrap_or(0u32)
+    }
 }
 
 #[cfg(test)]
@@ -546,7 +577,7 @@ mod tests {
     use payroll_registry::PayrollRegistry;
     use proof_verifier::{ProofVerifier, VerificationKey};
     use soroban_sdk::testutils::{Address as _, Events};
-    use soroban_sdk::{Env, IntoVal, Symbol, TryFromVal, TryIntoVal};
+    use soroban_sdk::{Env, IntoVal, Symbol, TryIntoVal};
 
     fn setup_addresses(env: &Env) -> ContractAddresses {
         env.mock_all_auths();
@@ -661,15 +692,13 @@ mod tests {
         assert_eq!(token_client.balance(&employee), 1_000);
 
         let events = env.events().all();
-        let has_payroll_processed = events.iter().any(|e| {
-            if let Some(val0) = e.1.get(0) {
-                if let Ok(sym) = Symbol::try_from_val(&env, &val0) {
-                    return sym == Symbol::new(&env, "PayrollProcessed");
-                }
-            }
-            false
-        });
-        assert!(has_payroll_processed, "PayrollProcessed event expected");
+        assert_eq!(events.len(), 6);
+        let event = events.get(events.len() - 1).unwrap();
+        assert_eq!(event.1.len(), 2);
+        let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+        assert_eq!(sym0, Symbol::new(&env, "PayrollProcessed"));
+        let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+        assert_eq!(comp_id, company_id);
     }
 
     #[test]
@@ -975,15 +1004,11 @@ mod tests {
         assert_eq!(client.get_total_paid(&company_id), 2_500);
 
         let events = env.events().all();
-        let has_payroll_processed = events.iter().any(|e| {
-            if let Some(val0) = e.1.get(0) {
-                if let Ok(sym) = Symbol::try_from_val(&env, &val0) {
-                    return sym == Symbol::new(&env, "PayrollProcessed");
-                }
-            }
-            false
-        });
-        assert!(has_payroll_processed, "PayrollProcessed event expected");
+        assert_eq!(events.len(), 6);
+        let event = events.get(events.len() - 1).unwrap();
+        assert_eq!(event.1.len(), 2);
+        let sym: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+        assert_eq!(sym, Symbol::new(&env, "PayrollProcessed"));
 
         let replay = client.try_execute_payment(
             &company_id,

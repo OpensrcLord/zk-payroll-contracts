@@ -187,6 +187,15 @@ pub trait PayrollRegistryTrait {
 
     /// Retrieve employer-level payroll policy if configured.
     fn get_payroll_policy(env: Env, company_id: u64) -> Option<PayrollPolicy>;
+
+    /// Return the current company sequence counter (defaults to 0).
+    fn get_company_sequence(env: Env) -> u64;
+
+    /// Return any pending admin rotation proposal for a company.
+    fn get_pending_admin_rotation(env: Env, company_id: u64) -> Option<PendingCompanyRotation>;
+
+    /// Return any pending treasury rotation proposal for a company.
+    fn get_pending_treasury_rotation(env: Env, company_id: u64) -> Option<PendingCompanyRotation>;
 }
 
 // ---------------------------------------------------------------------------
@@ -775,6 +784,25 @@ impl PayrollRegistryTrait for PayrollRegistry {
         env.storage()
             .persistent()
             .get(&DataKey::PayrollPolicy(company_id))
+    }
+
+    fn get_company_sequence(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompanySequence)
+            .unwrap_or(0u64)
+    }
+
+    fn get_pending_admin_rotation(env: Env, company_id: u64) -> Option<PendingCompanyRotation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingAdminRotation(company_id))
+    }
+
+    fn get_pending_treasury_rotation(env: Env, company_id: u64) -> Option<PendingCompanyRotation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingTreasuryRotation(company_id))
     }
 }
 

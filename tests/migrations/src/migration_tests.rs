@@ -22,7 +22,7 @@
 //! - `mg_flow_*` — Active flow continuation tests
 
 #[cfg(test)]
-#[allow(clippy::module_inception)]
+#[allow(clippy::module_inception, unused_imports, unused_variables)]
 mod migration_tests {
     use audit_module::AuditModuleClient;
     use payment_executor::PaymentExecutorClient;
@@ -452,7 +452,7 @@ mod migration_tests {
         let p2 = period_2.unwrap();
         assert!(!p2.closed, "Period 2 must remain open");
 
-        // Close period 1 so a new period can be created
+        // Close open period so a new period can be created
         let _ = executor_client.close_period(&ctx.company_id_2, &1);
 
         // New periods can be created post-migration

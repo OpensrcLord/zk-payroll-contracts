@@ -179,6 +179,10 @@ impl AuditModule {
         payroll_events::emit_audit_pause_manager_set(&env, pause_manager);
     }
 
+    pub fn get_pause_manager(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::PauseManager)
+    }
+
     // -----------------------------------------------------------------------
     // View-key lifecycle
     // -----------------------------------------------------------------------
@@ -631,6 +635,10 @@ impl AuditModule {
         expected_hash: BytesN<32>,
         scope: AuditScope,
     ) -> Result<bool, AuditError> {
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if stored_hash == zero || expected_hash == zero {
+            panic!("Metadata hash cannot be all-zero digest");
+        }
         Self::authorize_auditor(&env, auditor.clone())?;
         Self::verify_scope_for_commitment(scope)?;
 

@@ -26,7 +26,7 @@
 //!
 //! let env = Env::default();
 //! let (company_id, fixture) = write_v1_company_fixture(&env, &contract_id);
-//! ```
+#![allow(unused_imports, unused_variables)]
 
 use payroll_registry::{CompanyInfo, EmployeeStatus, PendingCompanyRotation};
 use salary_commitment::{CommitmentSnapshot, PaymentNullifier, SalaryCommitment};
@@ -185,10 +185,10 @@ pub fn write_v1_payroll_run_fixture(
     employee_count: u32,
     status: ReconciliationStatus,
 ) -> PayrollRunFixture {
-    let timestamp = if env.ledger().timestamp() == 0 {
-        1_000_000 + run_id
-    } else {
+    let timestamp = if env.ledger().timestamp() > 0 {
         env.ledger().timestamp()
+    } else {
+        1_000_000
     };
 
     let run = PayrollRun {
@@ -384,15 +384,14 @@ pub fn write_v1_emergency_withdrawal(
     amount: i128,
     recipient: &Address,
 ) {
-    let timestamp = if env.ledger().timestamp() == 0 {
-        500_000
-    } else {
-        env.ledger().timestamp()
-    };
     let request = EmergencyWithdrawalRequest {
         amount,
         recipient: recipient.clone(),
-        requested_at: timestamp,
+        requested_at: if env.ledger().timestamp() > 0 {
+            env.ledger().timestamp()
+        } else {
+            1_000_000
+        },
         approved: false,
     };
 

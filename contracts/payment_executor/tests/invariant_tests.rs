@@ -94,6 +94,7 @@ fn setup_system<'a>(
 
     let commitment_admin = Address::generate(env);
     commitment_client.init_commitment_admin(&commitment_admin);
+    commitment_client.set_payroll_operator(&executor_id);
 
     let admin = Address::generate(env);
     let treasury = Address::generate(env);
@@ -454,7 +455,8 @@ fn test_period_payment_count_increments_per_payment() {
         let seed = 80 + i;
         let (emp, _) = register_employee(&env, &registry, &commitment_client, company_id, seed);
         let (pa, pb, pc, null) = make_proof(&env, seed);
-        executor.execute_payment(&company_id, &emp, &1_000, &pa, &pb, &pc, &null, &1);
+        let res = executor.try_execute_payment(&company_id, &emp, &1_000, &pa, &pb, &pc, &null, &1);
+        assert!(res.is_ok(), "execute_payment failed: {:?}", res);
 
         let period = executor.get_period(&company_id, &1).unwrap();
         assert_eq!(
