@@ -1103,4 +1103,86 @@ fn test_respond_to_challenge_rejection_does_not_require_a_proof_reference() {
     });
 
     assert!(result.is_ok());
+// ── Issue #330: Deterministic audit attestation digest builder tests ──────────
+
+#[test]
+fn test_build_audit_digest_deterministic() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+    let employer = soroban_sdk::Address::generate(&env);
+    let batch_root = BytesN::from_array(&env, &[0x11; 32]);
+
+    let input1 = AuditAttestationInput {
+        employer: employer.clone(),
+        period_start: 1_000,
+        period_end: 2_000,
+        batch_root: batch_root.clone(),
+        scope: AuditScope::FullCompany,
+        schema_version: 1,
+    };
+
+    let input2 = AuditAttestationInput {
+        employer: employer.clone(),
+        period_start: 1_000,
+        period_end: 2_000,
+        batch_root: batch_root.clone(),
+        scope: AuditScope::FullCompany,
+        schema_version: 1,
+    };
+
+    let digest1 = client.build_audit_digest(&input1);
+    let digest2 = client.build_audit_digest(&input2);
+
+    assert_eq!(digest1, digest2);
+    assert_ne!(digest1, BytesN::from_array(&env, &[0u8; 32]));
+}
+
+#[test]
+fn test_build_audit_digest_field_sensitivity() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+    let employer1 = soroban_sdk::Address::generate(&env);
+    let employer2 = soroban_sdk::Address::generate(&env);
+    let batch_root1 = BytesN::from_array(&env, &[0x11; 32]);
+    let batch_root2 = BytesN::from_array(&env, &[0x22; 32]);
+
+    let base = AuditAttestationInput {
+        employer: employer1.clone(),
+        period_start: 1_000,
+        period_end: 2_000,
+        batch_root: batch_root1.clone(),
+        scope: AuditScope::FullCompany,
+        schema_version: 1,
+    };
+    let base_digest = client.build_audit_digest(&base);
+
+    // Change employer
+    let mut diff_employer = base.clone();
+    diff_employer.employer = employer2;
+    assert_ne!(base_digest, client.build_audit_digest(&diff_employer));
+
+    // Change period start
+    let mut diff_start = base.clone();
+    diff_start.period_start = 1_001;
+    assert_ne!(base_digest, client.build_audit_digest(&diff_start));
+
+    // Change period end
+    let mut diff_end = base.clone();
+    diff_end.period_end = 2_001;
+    assert_ne!(base_digest, client.build_audit_digest(&diff_end));
+
+    // Change batch root
+    let mut diff_root = base.clone();
+    diff_root.batch_root = batch_root2;
+    assert_ne!(base_digest, client.build_audit_digest(&diff_root));
+
+    // Change scope
+    let mut diff_scope = base.clone();
+    diff_scope.scope = AuditScope::AggregateOnly;
+    assert_ne!(base_digest, client.build_audit_digest(&diff_scope));
+
+    // Change schema version
+    let mut diff_version = base.clone();
+    diff_version.schema_version = 2;
+    assert_ne!(base_digest, client.build_audit_digest(&diff_version));
 }

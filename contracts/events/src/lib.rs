@@ -159,7 +159,13 @@ pub fn emit_batch_checkpoint_started(
 ) {
     e.events().publish(
         (payroll_topic(), Symbol::new(e, "batch_checkpoint_started")),
-        (employer, batch_root, asset, execution_nonce, checkpoint_index),
+        (
+            employer,
+            batch_root,
+            asset,
+            execution_nonce,
+            checkpoint_index,
+        ),
     );
 }
 
@@ -175,7 +181,14 @@ pub fn emit_batch_checkpoint_updated(
 ) {
     e.events().publish(
         (payroll_topic(), Symbol::new(e, "batch_checkpoint_updated")),
-        (employer, batch_root, asset, execution_nonce, checkpoint_index, state),
+        (
+            employer,
+            batch_root,
+            asset,
+            execution_nonce,
+            checkpoint_index,
+            state,
+        ),
     );
 }
 
@@ -190,7 +203,13 @@ pub fn emit_batch_checkpoint_resumed(
 ) {
     e.events().publish(
         (payroll_topic(), Symbol::new(e, "batch_checkpoint_resumed")),
-        (employer, batch_root, asset, execution_nonce, checkpoint_index),
+        (
+            employer,
+            batch_root,
+            asset,
+            execution_nonce,
+            checkpoint_index,
+        ),
     );
 }
 
@@ -784,10 +803,49 @@ pub fn emit_audit_pause_manager_set(e: &Env, pause_manager: Address) {
         .publish((Symbol::new(e, "AuditPauseMgrSet"),), (pause_manager,));
 }
 
+/// Emitted when an employer-level payroll policy is set or updated (Issue #329).
+pub fn emit_payroll_policy_set(
+    e: &Env,
+    company_id: u64,
+    settlement_window: u64,
+    reserve_ratio_bps: u32,
+    approval_threshold: u32,
+    audit_retention_period: u64,
+    auto_settlement_enabled: bool,
+) {
+    e.events().publish(
+        (Symbol::new(e, "PayrollPolicySet"), company_id),
+        (
+            settlement_window,
+            reserve_ratio_bps,
+            approval_threshold,
+            audit_retention_period,
+            auto_settlement_enabled,
+        ),
+    );
+}
+
+/// Emitted when an emergency commitment rotation occurs (Issue #331).
+pub fn emit_emergency_commitment_rotated(
+    e: &Env,
+    employee: Address,
+    old_commitment: BytesN<32>,
+    new_commitment: BytesN<32>,
+    reason: Symbol,
+) {
+    e.events().publish(
+        (Symbol::new(e, "EmergencyWalletRotated"), employee),
+        (old_commitment, new_commitment, reason),
+    );
+}
+
 /// Emitted when locked payroll funds are updated (#343).
 pub fn emit_locked_funds_updated(e: &Env, asset: Address, locked_amount: i128) {
     e.events().publish(
-        (Symbol::new(e, "treasury"), Symbol::new(e, "locked_funds_updated")),
+        (
+            Symbol::new(e, "treasury"),
+            Symbol::new(e, "locked_funds_updated"),
+        ),
         (asset, locked_amount),
     );
 }
@@ -864,7 +922,12 @@ pub fn emit_reservation_expiry_released(e: &Env, asset: Address, released_amount
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Emitted when a payroll run is archived for long-term reporting (#335).
-pub fn emit_payroll_run_archived(e: &Env, run_id: u64, archived_by: Address, archive_reason: Symbol) {
+pub fn emit_payroll_run_archived(
+    e: &Env,
+    run_id: u64,
+    archived_by: Address,
+    archive_reason: Symbol,
+) {
     e.events().publish(
         (payroll_topic(), Symbol::new(e, "run_archived")),
         (run_id, archived_by, archive_reason),

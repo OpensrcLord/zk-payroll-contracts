@@ -221,7 +221,11 @@ pub fn write_v1_pending_run_fixture(
     total_amount: i128,
     employee_count: u32,
 ) {
-    let timestamp = env.ledger().timestamp();
+    let timestamp = if env.ledger().timestamp() == 0 {
+        1_000_000 + run_id
+    } else {
+        env.ledger().timestamp()
+    };
 
     let pending = PendingPayrollRun {
         run_id,

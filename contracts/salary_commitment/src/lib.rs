@@ -248,9 +248,17 @@ impl SalaryCommitmentContract {
         updated
     }
 
+    pub const ROTATION_COOLDOWN_PERIOD: u64 = 86_400;
+
+    /// Get the cooldown period for standard commitment rotations (in seconds).
+    pub fn get_rotation_cooldown_period(_env: Env) -> u64 {
+        Self::ROTATION_COOLDOWN_PERIOD
+    }
+
     /// Rotate a salary commitment: archive the old one with `revoked = true`
     /// and store the new one. Old commitments CANNOT be used for future payroll
     /// proofs (see `is_commitment_active`).
+    /// Enforces a cooldown period since the last update (issue #331).
     /// Only the HR admin may call.
     ///
     /// Fails if the employee's commitment is currently locked (see
@@ -274,6 +282,16 @@ impl SalaryCommitmentContract {
             .get(&key)
             .expect("Commitment not found");
 
+        let current_time = env.ledger().timestamp();
+        if existing.updated_at > 0
+            && current_time
+                < existing
+                    .updated_at
+                    .saturating_add(Self::ROTATION_COOLDOWN_PERIOD)
+        {
+            panic!("Rotation cooldown period has not elapsed");
+        }
+
         // Mark active commitment as revoked
         existing.revoked = true;
         env.storage().persistent().set(&key, &existing);
@@ -285,6 +303,59 @@ impl SalaryCommitmentContract {
         let rotated = Self::store_commitment(env.clone(), employee.clone(), new_commitment);
 
         // Emit an explicit rotation event
+        payroll_events::emit_commitment_rotated(
+            &env,
+            employee,
+            existing.commitment,
+            rotated.commitment.clone(),
+        );
+
+        rotated
+    }
+
+    /// Rotate a salary commitment immediately under emergency conditions (issue #331).
+    /// Bypasses the standard rotation cooldown period.
+    /// Requires authorization from the HR admin.
+    pub fn rotate_commitment_emergency(
+        env: Env,
+        employee: Address,
+        new_commitment: BytesN<32>,
+        reason: Symbol,
+    ) -> SalaryCommitment {
+        Self::require_not_paused(&env);
+        Self::require_admin(&env);
+
+        if Self::is_commitment_locked(env.clone(), employee.clone()) {
+            panic!("Commitment is locked: cannot rotate until unlocked by admin");
+        }
+
+        let key = DataKey::Commitment(employee.clone());
+        let mut existing: SalaryCommitment = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Commitment not found");
+
+        // Mark active commitment as revoked
+        existing.revoked = true;
+        env.storage().persistent().set(&key, &existing);
+
+        // Archive the revoked commitment
+        Self::archive_commitment(&env, &employee, &existing.commitment, existing.version);
+
+        // Store the new active commitment
+        let rotated = Self::store_commitment(env.clone(), employee.clone(), new_commitment.clone());
+
+        // Emit emergency rotation event
+        payroll_events::emit_emergency_commitment_rotated(
+            &env,
+            employee.clone(),
+            existing.commitment.clone(),
+            new_commitment.clone(),
+            reason,
+        );
+
+        // Emit standard rotation event for backwards compatibility with indexers
         payroll_events::emit_commitment_rotated(
             &env,
             employee,
@@ -642,8 +713,8 @@ impl SalaryCommitmentContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events};
-    use soroban_sdk::{Env, IntoVal, Symbol, TryIntoVal};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger as _};
+    use soroban_sdk::{Env, IntoVal, Symbol, TryFromVal, TryIntoVal};
 
     fn setup_with_admin() -> (Env, soroban_sdk::Address, Address) {
         let env = Env::default();
@@ -1195,5 +1266,116 @@ mod tests {
             },
         }]);
         client.set_payroll_operator(&operator);
+    }
+
+    // ── Issue #331: Employee wallet rotation cooling periods & emergency rotation ─
+
+    #[test]
+    #[should_panic(expected = "Rotation cooldown period has not elapsed")]
+    fn test_rotate_commitment_cooldown_enforced() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee = Address::generate(&env);
+        let cmt1 = BytesN::from_array(&env, &[1u8; 32]);
+        let cmt2 = BytesN::from_array(&env, &[2u8; 32]);
+
+        env.ledger().set_timestamp(1_000_000);
+        client.store_commitment(&employee, &cmt1);
+
+        // Try rotating before cooldown has elapsed (e.g. 10 hours later)
+        env.ledger().set_timestamp(1_000_000 + 36_000);
+        client.rotate_commitment(&employee, &cmt2);
+    }
+
+    #[test]
+    fn test_rotate_commitment_after_cooldown_succeeds() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee = Address::generate(&env);
+        let cmt1 = BytesN::from_array(&env, &[1u8; 32]);
+        let cmt2 = BytesN::from_array(&env, &[2u8; 32]);
+
+        env.ledger().set_timestamp(1_000_000);
+        client.store_commitment(&employee, &cmt1);
+
+        // Rotate after cooldown has elapsed (24 hours + 1 second)
+        env.ledger().set_timestamp(1_000_000 + 86_401);
+        let rotated = client.rotate_commitment(&employee, &cmt2);
+        assert_eq!(rotated.commitment, cmt2);
+        assert!(!rotated.revoked);
+    }
+
+    #[test]
+    fn test_rotate_commitment_emergency_bypasses_cooldown() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee = Address::generate(&env);
+        let cmt1 = BytesN::from_array(&env, &[1u8; 32]);
+        let cmt2 = BytesN::from_array(&env, &[2u8; 32]);
+
+        env.ledger().set_timestamp(1_000_000);
+        client.store_commitment(&employee, &cmt1);
+
+        // Emergency rotation 5 seconds later should succeed
+        env.ledger().set_timestamp(1_000_005);
+        let reason = Symbol::new(&env, "compromised");
+        let rotated = client.rotate_commitment_emergency(&employee, &cmt2, &reason);
+        assert_eq!(rotated.commitment, cmt2);
+        assert!(!rotated.revoked);
+
+        // Verify history recorded
+        let history = client.get_commitment_history(&employee);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.get(0).unwrap().commitment, cmt1);
+    }
+
+    #[test]
+    fn test_rotate_commitment_emergency_emits_event() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee = Address::generate(&env);
+        let cmt1 = BytesN::from_array(&env, &[1u8; 32]);
+        let cmt2 = BytesN::from_array(&env, &[2u8; 32]);
+
+        env.ledger().set_timestamp(1_000_000);
+        client.store_commitment(&employee, &cmt1);
+
+        let before = env.events().all().len();
+        let reason = Symbol::new(&env, "key_lost");
+        client.rotate_commitment_emergency(&employee, &cmt2, &reason);
+        let after = env.events().all().len();
+        assert!(after > before);
+
+        let events = env.events().all();
+        let has_emergency_event = events.iter().any(|e| {
+            if let Some(val0) = e.1.get(0) {
+                if let Ok(sym) = soroban_sdk::Symbol::try_from_val(&env, &val0) {
+                    return sym == Symbol::new(&env, "EmergencyWalletRotated");
+                }
+            }
+            false
+        });
+        assert!(has_emergency_event, "EmergencyWalletRotated event expected");
+    }
+
+    #[test]
+    #[should_panic(expected = "Commitment is locked: cannot rotate until unlocked by admin")]
+    fn test_rotate_commitment_emergency_rejects_locked_commitment() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee = Address::generate(&env);
+        let cmt1 = BytesN::from_array(&env, &[1u8; 32]);
+        let cmt2 = BytesN::from_array(&env, &[2u8; 32]);
+
+        client.store_commitment(&employee, &cmt1);
+        client.lock_commitment_updates(&employee);
+
+        let reason = Symbol::new(&env, "emergency");
+        client.rotate_commitment_emergency(&employee, &cmt2, &reason);
     }
 }
