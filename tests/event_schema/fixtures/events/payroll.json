@@ -325,5 +325,17 @@
       { "name": "reviewer", "type": "Address" },
       { "name": "reason", "type": "Symbol" }
     ]
+  },
+  "payroll.reservation_created": {
+    "schema_version": 1,
+    "topics": [
+      { "type": "Symbol", "value": "payroll" },
+      { "type": "Symbol", "value": "reservation_created" }
+    ],
+    "data": [
+      { "name": "asset", "type": "Address" },
+      { "name": "reserved_amount", "type": "i128" },
+      { "name": "expires_at", "type": "u64" }
+    ]
   }
 }

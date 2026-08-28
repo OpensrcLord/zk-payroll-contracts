@@ -246,6 +246,7 @@ version = "0.1.0"
 dependencies = [
  "pause_manager",
  "payroll_events",
+ "shared_errors",
  "soroban-sdk",
 ]
 

@@ -986,6 +986,123 @@ fn test_verify_payroll_metadata_revoked_auditor_rejected() {
     assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyNotFound);
 }
 
+// ---------------------------------------------------------------------------
+// Proof reference format validation (#389)
+// ---------------------------------------------------------------------------
+
+fn new_challenge(env: &Env, contract_id: &soroban_sdk::Address) -> (Symbol, super::challenge::ChallengeId) {
+    let company_id = Symbol::new(env, "acme");
+    let auditor = soroban_sdk::Address::generate(env);
+    let payroll_period = Symbol::new(env, "2025_01");
+    let batch_commitment_hash = BytesN::from_array(env, &[7u8; 32]);
+    let deadline_ledger = env.ledger().sequence() + 1_000;
+    let description = soroban_sdk::String::from_str(env, "please substantiate this batch");
+
+    let challenge_id = env.as_contract(contract_id, || {
+        super::challenge::create_challenge(
+            env,
+            company_id.clone(),
+            auditor,
+            payroll_period,
+            batch_commitment_hash,
+            super::challenge::ChallengeReasonCode::Verification,
+            description,
+            deadline_ledger,
+        )
+        .unwrap()
+    });
+
+    (company_id, challenge_id)
+}
+
+#[test]
+fn test_is_valid_proof_reference_rejects_zero_hash() {
+    let env = Env::default();
+    let zero = BytesN::from_array(&env, &[0u8; 32]);
+    assert!(!super::challenge::is_valid_proof_reference(&env, &zero));
+}
+
+#[test]
+fn test_is_valid_proof_reference_accepts_non_zero_hash() {
+    let env = Env::default();
+    let hash = BytesN::from_array(&env, &[9u8; 32]);
+    assert!(super::challenge::is_valid_proof_reference(&env, &hash));
+}
+
+#[test]
+fn test_respond_to_challenge_rejects_empty_proof_reference() {
+    let (env, contract_id) = setup();
+    let (company_id, challenge_id) = new_challenge(&env, &contract_id);
+    let responder = soroban_sdk::Address::generate(&env);
+
+    let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let result = env.as_contract(&contract_id, || {
+        super::challenge::respond_to_challenge(
+            &env,
+            company_id,
+            challenge_id,
+            responder,
+            zero_hash,
+            None,
+        )
+    });
+
+    assert_eq!(
+        result.unwrap_err(),
+        shared_errors::AuditError::InvalidProofReference
+    );
+}
+
+#[test]
+fn test_respond_to_challenge_accepts_valid_proof_reference() {
+    let (env, contract_id) = setup();
+    let (company_id, challenge_id) = new_challenge(&env, &contract_id);
+    let responder = soroban_sdk::Address::generate(&env);
+
+    let proof_reference_hash = BytesN::from_array(&env, &[42u8; 32]);
+    let result = env.as_contract(&contract_id, || {
+        super::challenge::respond_to_challenge(
+            &env,
+            company_id.clone(),
+            challenge_id,
+            responder,
+            proof_reference_hash.clone(),
+            None,
+        )
+    });
+    assert!(result.is_ok());
+
+    let stored = env
+        .as_contract(&contract_id, || {
+            super::challenge::get_challenge_response(&env, company_id, challenge_id)
+        })
+        .expect("response should be recorded");
+    assert_eq!(stored.proof_reference_hash, proof_reference_hash);
+}
+
+#[test]
+fn test_respond_to_challenge_rejection_does_not_require_a_proof_reference() {
+    let (env, contract_id) = setup();
+    let (company_id, challenge_id) = new_challenge(&env, &contract_id);
+    let responder = soroban_sdk::Address::generate(&env);
+
+    // A rejection explains why the challenge is invalid — it has no proof to
+    // reference, so the all-zero sentinel must be accepted here even though
+    // it is rejected for an accepting response.
+    let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let reason = soroban_sdk::String::from_str(&env, "commitment predates this period");
+    let result = env.as_contract(&contract_id, || {
+        super::challenge::respond_to_challenge(
+            &env,
+            company_id,
+            challenge_id,
+            responder,
+            zero_hash,
+            Some(reason),
+        )
+    });
+
+    assert!(result.is_ok());
 // ── Issue #330: Deterministic audit attestation digest builder tests ──────────
 
 #[test]
