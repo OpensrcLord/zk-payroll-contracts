@@ -776,6 +776,32 @@ impl Payroll {
         }
     }
 
+    /// Reject a payroll batch that lists the same employee wallet more than
+    /// once (#379).
+    ///
+    /// A wallet appearing twice in one batch would be paid twice out of a
+    /// single authorised spend, and makes reconciliation ambiguous. The check
+    /// runs before any state is written, so a duplicate batch is rejected
+    /// atomically with no partial effects.
+    ///
+    /// The comparison is a pairwise scan. `MAX_BATCH` bounds the input length,
+    /// so the worst case stays inside the contract compute budget and no
+    /// auxiliary storage or heap allocation is required.
+    ///
+    /// # Panics
+    /// - If any employee address appears more than once in `employees`.
+    fn validate_no_duplicate_employees(employees: &Vec<Address>) {
+        let count = employees.len();
+        for i in 0..count {
+            let current = employees.get(i).unwrap();
+            for j in (i + 1)..count {
+                if current == employees.get(j).unwrap() {
+                    panic!("Duplicate employee wallet in payroll batch");
+                }
+            }
+        }
+    }
+
     /// Validate that a nonce is monotonically increasing for the given employer (#362).
     ///
     /// This function enforces that each payroll run for an employer uses a nonce
@@ -2015,6 +2041,9 @@ impl Payroll {
             BytesN::from_array(&e, &[0u8; 32])
         };
 
+        // #379 — reject a batch that pays the same wallet twice.
+        Self::validate_no_duplicate_employees(&employees);
+
         let mut total: i128 = 0;
         for i in 0..count {
             let amt = amounts.get(i).unwrap();
@@ -2242,6 +2271,9 @@ impl Payroll {
         } else {
             BytesN::from_array(&e, &[0u8; 32])
         };
+
+        // #379 — reject a batch that pays the same wallet twice.
+        Self::validate_no_duplicate_employees(&employees);
 
         let mut total: i128 = 0;
         for i in 0..count {
