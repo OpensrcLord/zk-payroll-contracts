@@ -10,6 +10,14 @@ use payroll_registry::PayrollRegistryClient;
 use proof_verifier::ProofVerifierClient;
 use salary_commitment::SalaryCommitmentContractClient;
 
+// ── Issue #357: overpayment review guard ─────────────────────────────────────
+pub mod events;
+pub mod reviews;
+use reviews::{
+    emit_archival_blocked, get_overpayment_review, has_open_review, open_overpayment_review,
+    resolve_overpayment_review, OverpaymentReview, ReviewStatus,
+};
+
 const MAX_BATCH: u32 = 50;
 
 #[contract]
@@ -2278,9 +2286,11 @@ impl Payroll {
             // data   : (employee, amount)
         }
 
+        let executed_at = e.ledger().timestamp();
+
         let run = PayrollRun {
             run_id,
-            executed_at: e.ledger().timestamp(),
+            executed_at,
             admin: addrs.admin.clone(),
             total_amount: expected_total_spend,
             employee_count: count,
@@ -2289,6 +2299,14 @@ impl Payroll {
             reconciliation_status: ReconciliationStatus::Unreconciled,
             metadata_hash: BytesN::from_array(&e, &[0u8; 32]),
         };
+
+        // #358 — write the settlement completion marker atomically with the
+        // run record.  This is the authoritative on-chain proof that the batch
+        // reached finalization.  A Soroban transaction is atomic: if any step
+        // above panicked, neither write reaches persistent storage.
+        e.storage()
+            .persistent()
+            .set(&DataKey::SettledBatch(run_id), &executed_at);
         e.storage()
             .persistent()
             .set(&DataKey::PayrollRun(run_id), &run);
@@ -2395,6 +2413,15 @@ impl Payroll {
     ///
     /// Only the `admin` may update the reconciliation status.
     /// Emits a `reconciliation_updated` event.
+    ///
+    /// # Overpayment review guard (issue #357)
+    ///
+    /// If the run has an open overpayment review, transitioning to
+    /// `ReconciliationStatus::Reconciled` is blocked.  The transition to
+    /// `Unreconciled` or `Failed` is still allowed so operators can roll back a
+    /// premature reconciliation without closing the review first.  An
+    /// `("payroll", "archival_blocked")` event is emitted before the panic so
+    /// off-chain indexers get a structured signal.
     pub fn update_reconciliation_status(
         e: Env,
         admin: Address,
@@ -2413,6 +2440,15 @@ impl Payroll {
         }
 
         admin.require_auth();
+
+        // ── Issue #357: block archival while an open review exists ────────────
+        if status == ReconciliationStatus::Reconciled && has_open_review(&e, run_id) {
+            // Fetch the review to include its ID in the guard event.
+            if let Some(rev) = get_overpayment_review(&e, run_id) {
+                emit_archival_blocked(&e, run_id, rev.review_id);
+            }
+            panic!("Run has an open overpayment review; resolve it before archiving");
+        }
 
         let run_key = DataKey::PayrollRun(run_id);
 
