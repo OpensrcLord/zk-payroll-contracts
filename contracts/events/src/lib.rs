@@ -25,6 +25,25 @@
 
 use soroban_sdk::{symbol_short, Address, BytesN, Env, Symbol};
 
+/// Pause category symbols for event emission.
+/// Defined here to avoid circular dependency with pause_manager.
+mod pause_category_symbols {
+    use soroban_sdk::{Env, Symbol};
+    
+    pub fn payroll(e: &Env) -> Symbol {
+        Symbol::new(e, "payroll")
+    }
+    pub fn treasury(e: &Env) -> Symbol {
+        Symbol::new(e, "treasury")
+    }
+    pub fn audit(e: &Env) -> Symbol {
+        Symbol::new(e, "audit")
+    }
+    pub fn admin(e: &Env) -> Symbol {
+        Symbol::new(e, "admin")
+    }
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Topic helpers
 // ═════════════════════════════════════════════════════════════════════════════
@@ -711,6 +730,22 @@ pub fn emit_unpaused(e: &Env) {
     e.events().publish(
         (Symbol::new(e, "PauseManager"), Symbol::new(e, "unpaused")),
         (),
+    );
+}
+
+/// Emitted when a specific category is paused.
+pub fn emit_category_paused(e: &Env, category_symbol: Symbol) {
+    e.events().publish(
+        (Symbol::new(e, "PauseManager"), Symbol::new(e, "category_paused")),
+        (category_symbol,),
+    );
+}
+
+/// Emitted when a specific category is unpaused.
+pub fn emit_category_unpaused(e: &Env, category_symbol: Symbol) {
+    e.events().publish(
+        (Symbol::new(e, "PauseManager"), Symbol::new(e, "category_unpaused")),
+        (category_symbol,),
     );
 }
 
