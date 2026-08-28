@@ -137,6 +137,10 @@ pub enum DataKey {
 // Contract
 // ---------------------------------------------------------------------------
 
+/// Auditor challenge/response workflow (create_challenge, respond_to_challenge,
+/// proof-reference format validation) — see module docs in `challenge.rs`.
+pub mod challenge;
+
 #[contract]
 pub struct AuditModule;
 
