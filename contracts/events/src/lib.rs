@@ -210,6 +210,16 @@ pub fn emit_draft_amended(e: &Env, draft_id: u64, new_total: i128, amendment_cou
     );
 }
 
+/// Emitted when an optional reconciliation note hash is attached to a draft (#387).
+///
+/// Only the hash reference is emitted — raw note text is never placed on-chain.
+pub fn emit_draft_note_hash_set(e: &Env, draft_id: u64, note_hash: BytesN<32>) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "draft_note_hash_set")),
+        (draft_id, note_hash),
+    );
+}
+
 /// Emitted when a payroll run draft is finalized (locked).
 pub fn emit_draft_finalized(e: &Env, draft_id: u64, total: i128, amendment_count: u32) {
     e.events().publish(
@@ -820,6 +830,18 @@ pub fn emit_compliance_hold_released(e: &Env, hold_id: u64, released_by: Address
 // ═════════════════════════════════════════════════════════════════════════════
 // Funding Reservation Expiry Events (#337)
 // ═════════════════════════════════════════════════════════════════════════════
+
+/// Emitted when a funding reservation is created (#390).
+///
+/// Lets SDK indexers update treasury readiness without re-reading all payroll
+/// state. Payload carries only the asset, reserved amount, and expiry — no
+/// private payroll rows.
+pub fn emit_reservation_created(e: &Env, asset: Address, reserved_amount: i128, expires_at: u64) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "reservation_created")),
+        (asset, reserved_amount, expires_at),
+    );
+}
 
 /// Emitted when a funding reservation expires (#337).
 pub fn emit_reservation_expired(e: &Env, asset: Address, amount: i128, expired_at: u64) {

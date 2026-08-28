@@ -431,6 +431,8 @@ pub enum DataKey {
     RunDraft(u64),
     /// Auto-increment counter for draft IDs (issue #89).
     RunDraftCounter,
+    /// Optional reconciliation note hash attached to a draft (#387).
+    DraftNoteHash(u64),
     /// Pending admin rotation proposal (issue #91).
     PendingAdminRotation,
     /// Pending treasury-owner rotation proposal (issue #91).
@@ -2432,6 +2434,47 @@ impl Payroll {
         );
     }
 
+    /// Attach an optional reconciliation note hash to a payroll run draft (#387).
+    ///
+    /// Only a hash reference is stored/emitted — raw note text must never be
+    /// placed on-chain. Independent of `amend_run_draft`'s numeric fields.
+    ///
+    /// # Panics
+    /// - If the draft does not exist
+    /// - If `note_hash` is all-zero bytes (rejected as malformed/empty)
+    pub fn set_draft_note_hash(e: Env, admin: Address, draft_id: u64, note_hash: BytesN<32>) {
+        Self::require_not_paused(&e);
+        Self::validate_draft_id(draft_id);
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        Self::validate_non_zero_digest(&e, &note_hash, "note_hash");
+
+        if !e.storage().persistent().has(&DataKey::RunDraft(draft_id)) {
+            panic!("Draft not found");
+        }
+
+        e.storage()
+            .persistent()
+            .set(&DataKey::DraftNoteHash(draft_id), &note_hash);
+
+        payroll_events::emit_draft_note_hash_set(&e, draft_id, note_hash);
+    }
+
+    /// Get the optional reconciliation note hash attached to a draft, if any (#387).
+    pub fn get_draft_note_hash(e: Env, draft_id: u64) -> Option<BytesN<32>> {
+        e.storage()
+            .persistent()
+            .get(&DataKey::DraftNoteHash(draft_id))
+    }
+
     /// Update the reconciliation status of a completed payroll run.
     ///
     /// Only the `admin` may update the reconciliation status.
@@ -3452,7 +3495,9 @@ impl Payroll {
 
         e.storage()
             .persistent()
-            .set(&DataKey::ReservationExpiry(asset), &expiry);
+            .set(&DataKey::ReservationExpiry(asset.clone()), &expiry);
+
+        payroll_events::emit_reservation_created(&e, asset, reserved_amount, expires_at);
     }
 
     /// Release expired funding reservations and make funds available (#337).
@@ -3567,7 +3612,8 @@ mod tests {
     use proof_verifier::{ProofVerifier, VerificationKey};
     use salary_commitment::SalaryCommitmentContract;
     use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::{Env, IntoVal};
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{Env, IntoVal, TryIntoVal};
 
     fn mock_proof(env: &Env) -> BytesN<256> {
         BytesN::from_array(env, &[0u8; 256])
@@ -4027,6 +4073,136 @@ mod tests {
 
         let result = payroll_client.try_amend_run_draft(&admin, &id, &9_000i128, &18u32);
         assert!(result.is_err());
+    }
+
+    // ============================================================================
+    // Issue #388: Employee Removal Before Lock Tests
+    // ============================================================================
+
+    #[test]
+    fn test_employee_removed_from_draft_before_lock() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let id = payroll_client.create_run_draft(
+            &admin,
+            &10_000i128,
+            &20u32,
+            &Symbol::new(&env, "MAY"),
+        );
+
+        // Remove 3 employees from the still-editable (Pending) draft.
+        payroll_client.amend_run_draft(&admin, &id, &10_000i128, &17u32);
+
+        let draft = payroll_client.get_run_draft(&id);
+        assert_eq!(draft.employee_count, 17u32);
+        assert_eq!(draft.amendment_count, 1u32);
+        assert_eq!(draft.state, RunDraftState::Pending);
+        // Total amount is left for the caller to reconcile explicitly — removal
+        // does not silently recompute it.
+        assert_eq!(draft.total_amount, 10_000i128);
+    }
+
+    #[test]
+    fn test_employee_removal_rejected_after_lock() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let id = payroll_client.create_run_draft(
+            &admin,
+            &10_000i128,
+            &20u32,
+            &Symbol::new(&env, "JUN"),
+        );
+        payroll_client.finalize_run_draft(&admin, &id);
+
+        // Attempting to remove an employee (reduce the count) after lock must fail.
+        let result = payroll_client.try_amend_run_draft(&admin, &id, &10_000i128, &19u32);
+        assert!(result.is_err());
+
+        // The locked draft's employee count is unchanged.
+        let draft = payroll_client.get_run_draft(&id);
+        assert_eq!(draft.employee_count, 20u32);
+        assert_eq!(draft.state, RunDraftState::Finalized);
+    }
+
+    #[test]
+    fn test_employee_removal_rejected_after_submit() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let id = payroll_client.create_run_draft(
+            &admin,
+            &6_000i128,
+            &8u32,
+            &Symbol::new(&env, "JUL"),
+        );
+        payroll_client.finalize_run_draft(&admin, &id);
+        payroll_client.submit_run_draft(&admin, &id);
+
+        let result = payroll_client.try_amend_run_draft(&admin, &id, &6_000i128, &6u32);
+        assert!(result.is_err());
+    }
+
+    // ============================================================================
+    // Issue #387: Optional Payroll Note Hash Tests
+    // ============================================================================
+
+    #[test]
+    fn test_draft_note_hash_absent_by_default() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let id = payroll_client.create_run_draft(
+            &admin,
+            &4_000i128,
+            &4u32,
+            &Symbol::new(&env, "AUG"),
+        );
+
+        assert_eq!(payroll_client.get_draft_note_hash(&id), None);
+    }
+
+    #[test]
+    fn test_draft_note_hash_can_be_set_and_read() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let id = payroll_client.create_run_draft(
+            &admin,
+            &4_000i128,
+            &4u32,
+            &Symbol::new(&env, "SEP"),
+        );
+
+        let note_hash = test_nonce(&env, 42);
+        payroll_client.set_draft_note_hash(&admin, &id, &note_hash);
+
+        assert_eq!(payroll_client.get_draft_note_hash(&id), Some(note_hash));
+    }
+
+    #[test]
+    fn test_draft_note_hash_rejects_zero_hash() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let id = payroll_client.create_run_draft(
+            &admin,
+            &4_000i128,
+            &4u32,
+            &Symbol::new(&env, "OCT"),
+        );
+
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let result = payroll_client.try_set_draft_note_hash(&admin, &id, &zero_hash);
+        assert!(result.is_err());
+        assert_eq!(payroll_client.get_draft_note_hash(&id), None);
     }
 
     #[test]
@@ -6559,6 +6735,54 @@ mod tests {
         let exp_policy = expiry.unwrap();
         assert_eq!(exp_policy.reserved_amount, 5000i128);
         assert_eq!(exp_policy.asset, token_id);
+    }
+
+    // ============================================================================
+    // Issue #390: Funding Reservation Created Event Tests
+    // ============================================================================
+
+    #[test]
+    fn test_reservation_created_emits_event_for_single_asset() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee, token_id) =
+            setup_payroll_with_token(&env);
+
+        payroll_client.set_reservation_expiry_policy(&admin, &token_id, &7_500i128, &43_200u64);
+
+        let events = env.events().all();
+        let (_, topics, data) = events.get(events.len() - 1).unwrap();
+        let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+            (symbol_short!("payroll"), Symbol::new(&env, "reservation_created")).into_val(&env);
+        assert_eq!(topics, expected_topics);
+
+        let decoded: (Address, i128, u64) = data.try_into_val(&env).unwrap();
+        // asset, reserved_amount, expires_at — no private payroll rows.
+        assert_eq!(decoded.0, token_id);
+        assert_eq!(decoded.1, 7_500i128);
+    }
+
+    #[test]
+    fn test_reservation_created_emits_one_event_per_asset() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee, token_id) =
+            setup_payroll_with_token(&env);
+        let other_asset = Address::generate(&env);
+
+        payroll_client.set_reservation_expiry_policy(&admin, &token_id, &1_000i128, &1_000u64);
+        payroll_client.set_reservation_expiry_policy(&admin, &other_asset, &2_000i128, &2_000u64);
+
+        // Each asset gets its own independent reservation record.
+        let first = payroll_client.get_reservation_expiry(&token_id).unwrap();
+        let second = payroll_client.get_reservation_expiry(&other_asset).unwrap();
+        assert_eq!(first.reserved_amount, 1_000i128);
+        assert_eq!(second.reserved_amount, 2_000i128);
+
+        // The second call's event reflects the second asset, not the first.
+        let events = env.events().all();
+        let (_, _, data) = events.get(events.len() - 1).unwrap();
+        let decoded: (Address, i128, u64) = data.try_into_val(&env).unwrap();
+        assert_eq!(decoded.0, other_asset);
+        assert_eq!(decoded.1, 2_000i128);
     }
 
     #[test]
