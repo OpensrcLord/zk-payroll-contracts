@@ -933,3 +933,402 @@ pub fn emit_payroll_run_archived(
         (run_id, archived_by, archive_reason),
     );
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Settlement Window Events — Issue #316
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Emitted when the settlement window contract is initialized.
+pub fn emit_settlement_window_initialized(e: &Env, admin: Address) {
+    e.events()
+        .publish((Symbol::new(e, "SettleWinInit"),), (admin,));
+}
+
+/// Emitted when a new settlement period is created.
+pub fn emit_settlement_period_created(
+    e: &Env,
+    company_id: u64,
+    period_id: u32,
+    open_at: u64,
+    execute_at: u64,
+    grace_until: u64,
+    close_at: u64,
+) {
+    e.events().publish(
+        (
+            Symbol::new(e, "SettlePeriodCreated"),
+            company_id,
+            period_id,
+        ),
+        (open_at, execute_at, grace_until, close_at),
+    );
+}
+
+/// Emitted on any settlement period phase transition.
+pub fn emit_settlement_period_phase_changed(
+    e: &Env,
+    company_id: u64,
+    period_id: u32,
+    phase: Symbol,
+) {
+    e.events().publish(
+        (
+            Symbol::new(e, "SettlePeriodPhase"),
+            company_id,
+            period_id,
+        ),
+        (phase,),
+    );
+}
+
+/// Emitted when a settlement period is cancelled.
+pub fn emit_settlement_period_cancelled(
+    e: &Env,
+    company_id: u64,
+    period_id: u32,
+    cancelled_at: u64,
+) {
+    e.events().publish(
+        (
+            Symbol::new(e, "SettlePeriodCancelled"),
+            company_id,
+            period_id,
+        ),
+        (cancelled_at,),
+    );
+}
+
+/// Emitted when a settlement period expires after `grace_until`.
+pub fn emit_settlement_period_expired(
+    e: &Env,
+    company_id: u64,
+    period_id: u32,
+    expired_at: u64,
+) {
+    e.events().publish(
+        (
+            Symbol::new(e, "SettlePeriodExpired"),
+            company_id,
+            period_id,
+        ),
+        (expired_at,),
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Treasury Isolation Events — Issue #317
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Emitted when the treasury isolation contract is initialized.
+pub fn emit_treasury_isolation_initialized(e: &Env, admin: Address) {
+    e.events()
+        .publish((Symbol::new(e, "TreasIsoInit"),), (admin,));
+}
+
+/// Emitted when a new asset is registered for a company treasury.
+pub fn emit_treasury_asset_registered(
+    e: &Env,
+    company_id: u64,
+    asset: Address,
+    issuer: Address,
+    symbol: Symbol,
+) {
+    e.events().publish(
+        (Symbol::new(e, "TreasAssetReg"), company_id, asset),
+        (issuer, symbol),
+    );
+}
+
+/// Emitted when balance is credited to a (company, asset) treasury slot.
+pub fn emit_treasury_credited(e: &Env, company_id: u64, asset: Address, amount: i128) {
+    e.events().publish(
+        (Symbol::new(e, "TreasCredited"), company_id, asset),
+        (amount,),
+    );
+}
+
+/// Emitted when an amount is reserved for an in-flight payroll batch.
+pub fn emit_treasury_reserved(e: &Env, company_id: u64, asset: Address, amount: i128) {
+    e.events().publish(
+        (Symbol::new(e, "TreasReserved"), company_id, asset),
+        (amount,),
+    );
+}
+
+/// Emitted when a reservation is released (e.g. batch cancelled).
+pub fn emit_treasury_reserve_released(e: &Env, company_id: u64, asset: Address, amount: i128) {
+    e.events().publish(
+        (Symbol::new(e, "TreasReleased"), company_id, asset),
+        (amount,),
+    );
+}
+
+/// Emitted when a batch debit is executed successfully.
+pub fn emit_treasury_debited(e: &Env, company_id: u64, asset: Address, amount: i128) {
+    e.events().publish(
+        (Symbol::new(e, "TreasDebited"), company_id, asset),
+        (amount,),
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Privacy-Safe Payroll Lifecycle Events — Issue #318
+// ═════════════════════════════════════════════════════════════════════════════
+
+pub const LIFECYCLE_EVENT_SCHEMA_VERSION: u32 = 1;
+
+pub fn emit_lifecycle_batch_committed(
+    e: &Env,
+    company_id: u64,
+    period_id: u32,
+    batch_hash: BytesN<32>,
+    employee_count: u32,
+) {
+    e.events().publish(
+        (
+            Symbol::new(e, "BatchCommitted"),
+            company_id,
+            period_id,
+        ),
+        (
+            batch_hash,
+            employee_count,
+            LIFECYCLE_EVENT_SCHEMA_VERSION,
+        ),
+    );
+}
+
+pub fn emit_lifecycle_batch_locked(
+    e: &Env,
+    company_id: u64,
+    period_id: u32,
+    batch_hash: BytesN<32>,
+) {
+    e.events().publish(
+        (Symbol::new(e, "BatchLocked"), company_id, period_id),
+        (batch_hash, LIFECYCLE_EVENT_SCHEMA_VERSION),
+    );
+}
+
+pub fn emit_lifecycle_batch_executed(
+    e: &Env,
+    company_id: u64,
+    period_id: u32,
+    batch_hash: BytesN<32>,
+    payment_count: u32,
+) {
+    e.events().publish(
+        (Symbol::new(e, "BatchExecuted"), company_id, period_id),
+        (
+            batch_hash,
+            payment_count,
+            LIFECYCLE_EVENT_SCHEMA_VERSION,
+        ),
+    );
+}
+
+pub fn emit_lifecycle_period_settled(
+    e: &Env,
+    company_id: u64,
+    period_id: u32,
+    settled_at: u64,
+) {
+    e.events().publish(
+        (Symbol::new(e, "PeriodSettled"), company_id, period_id),
+        (settled_at, LIFECYCLE_EVENT_SCHEMA_VERSION),
+    );
+}
+
+pub fn emit_lifecycle_cancelled(
+    e: &Env,
+    company_id: u64,
+    period_id: u32,
+    reason_code: u32,
+) {
+    e.events().publish(
+        (Symbol::new(e, "PayrollCancelled"), company_id, period_id),
+        (reason_code, LIFECYCLE_EVENT_SCHEMA_VERSION),
+    );
+}
+
+pub fn emit_lifecycle_audit_granted(
+    e: &Env,
+    company_id: u64,
+    period_id: u32,
+    grant_id: u64,
+    expiration_ledger: u32,
+) {
+    e.events().publish(
+        (Symbol::new(e, "AuditGranted"), company_id, period_id),
+        (
+            grant_id,
+            expiration_ledger,
+            LIFECYCLE_EVENT_SCHEMA_VERSION,
+        ),
+    );
+}
+
+pub fn emit_lifecycle_treasury_ready(
+    e: &Env,
+    company_id: u64,
+    period_id: u32,
+    asset: Address,
+) {
+    e.events().publish(
+        (Symbol::new(e, "TreasuryReady"), company_id, period_id),
+        (asset, LIFECYCLE_EVENT_SCHEMA_VERSION),
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Retention Manager Events — Issue #321
+// ═════════════════════════════════════════════════════════════════════════════
+
+pub fn emit_retention_manager_initialized(e: &Env, admin: Address) {
+    e.events()
+        .publish((Symbol::new(e, "RetentionInit"),), (admin,));
+}
+
+pub fn emit_retention_record_registered(
+    e: &Env,
+    company_id: u64,
+    record_id: u64,
+    record_type: Symbol,
+    eligible_after: u64,
+) {
+    e.events().publish(
+        (Symbol::new(e, "RetentionRegistered"), company_id),
+        (record_id, record_type, eligible_after),
+    );
+}
+
+pub fn emit_retention_block_changed(
+    e: &Env,
+    company_id: u64,
+    record_id: u64,
+    block_type: Symbol,
+    blocked: bool,
+) {
+    e.events().publish(
+        (Symbol::new(e, "RetentionBlockChanged"), company_id),
+        (record_id, block_type, blocked),
+    );
+}
+
+pub fn emit_retention_record_pruned(
+    e: &Env,
+    company_id: u64,
+    record_id: u64,
+    record_type: Symbol,
+    pruned_at: u64,
+) {
+    e.events().publish(
+        (Symbol::new(e, "RetentionPruned"), company_id),
+        (record_id, record_type, pruned_at),
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Obligation Snapshot Verification Events — Issue #413
+// ═════════════════════════════════════════════════════════════════════════════
+
+pub fn emit_obligation_snapshot_recorded(
+    e: &Env,
+    run_id: u64,
+    obligation_root: BytesN<32>,
+    total_amount: i128,
+    count: u32,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "obligation_snapshot_recorded")),
+        (run_id, obligation_root, total_amount, count),
+    );
+}
+
+pub fn emit_obligation_snapshot_verified(
+    e: &Env,
+    run_id: u64,
+    snapshot_digest: BytesN<32>,
+    step: Symbol,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "obligation_snapshot_verified")),
+        (run_id, snapshot_digest, step),
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Multi-Stage Approval Rollback Events — Issue #414
+// ═════════════════════════════════════════════════════════════════════════════
+
+pub fn emit_approval_granted(
+    e: &Env,
+    draft_id: u64,
+    signer: Address,
+    stage: u32,
+    current_approvals: u32,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "approval_granted")),
+        (draft_id, signer, stage, current_approvals),
+    );
+}
+
+pub fn emit_approvals_rolled_back(
+    e: &Env,
+    draft_id: u64,
+    old_hash: BytesN<32>,
+    new_hash: BytesN<32>,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "approvals_rolled_back")),
+        (draft_id, old_hash, new_hash),
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Confidential Audit Trail Invariant Events — Issue #415
+// ═════════════════════════════════════════════════════════════════════════════
+
+pub fn emit_audit_marker(
+    e: &Env,
+    action_type: Symbol,
+    run_id: u64,
+    entity_hash: BytesN<32>,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "audit_marker")),
+        (action_type, run_id, entity_hash, e.ledger().timestamp()),
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Treasury Reservation Reconciliation Checkpoint Events — Issue #416
+// ═════════════════════════════════════════════════════════════════════════════
+
+pub fn emit_reservation_checkpoint_recorded(
+    e: &Env,
+    run_id: u64,
+    stage: u32,
+    expected_amount: i128,
+    actual_amount: i128,
+    is_reconciled: bool,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "reservation_checkpoint_recorded")),
+        (run_id, stage, expected_amount, actual_amount, is_reconciled),
+    );
+}
+
+pub fn emit_reservation_drift_detected(
+    e: &Env,
+    run_id: u64,
+    stage: u32,
+    expected_amount: i128,
+    actual_amount: i128,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "reservation_drift_detected")),
+        (run_id, stage, expected_amount, actual_amount),
+    );
+}

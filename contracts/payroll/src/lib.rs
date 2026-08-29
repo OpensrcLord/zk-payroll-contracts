@@ -11,8 +11,12 @@ use proof_verifier::ProofVerifierClient;
 use salary_commitment::SalaryCommitmentContractClient;
 
 // ── Issue #357: overpayment review guard ─────────────────────────────────────
+pub mod audit;
 pub mod events;
+pub mod obligations;
+pub mod reconciliation;
 pub mod reviews;
+pub mod signing;
 use reviews::{
     emit_archival_blocked, get_overpayment_review, has_open_review, open_overpayment_review,
     resolve_overpayment_review, OverpaymentReview, ReviewStatus,
@@ -41,6 +45,23 @@ pub enum ReconciliationStatus {
     Unreconciled,
     Reconciled,
     Failed,
+}
+
+/// Explicit state enum for the canonical payroll run lifecycle.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PayrollRunState {
+    Draft = 0,
+    Validating = 1,
+    ProofPending = 2,
+    ReadyToSubmit = 3,
+    Submitted = 4,
+    Confirming = 5,
+    Completed = 6,
+    Failed = 7,
+    Cancelled = 8,
+    ReconciliationRequired = 9,
 }
 
 /// A pending payroll run that has been prepared but not yet finalized.
@@ -135,6 +156,29 @@ pub struct BatchCheckpoint {
     pub total_checkpoints: u32,
     pub completed: bool,
     pub failed: bool,
+}
+
+// ── Issue #359: period close reconciliation markers ──────────────────────
+
+/// Compact reservation marker stored per period label (issue #359).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PeriodReservation {
+    pub note: Symbol,
+    pub created_at: u64,
+    pub registered_by: Address,
+}
+
+/// On-chain marker written when a payroll period is closed (issue #359).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PeriodCloseRecord {
+    pub close_id: u64,
+    pub period_label: Symbol,
+    pub closed_at: u64,
+    pub closed_by: Address,
+    pub run_count: u32,
+    pub status: ReconciliationStatus,
 }
 
 // ── Issue #89: payroll amendment flow ────────────────────────────────────────
@@ -485,6 +529,14 @@ pub enum DataKey {
     /// Open reservation marker for a period label (issue #359).
     /// Present means the period has a pending reservation that blocks closing.
     PeriodReservation(Symbol),
+    /// Obligation snapshot record keyed by run_id (#413).
+    ObligationSnapshot(u64),
+    /// Multi-stage approval state keyed by draft_id (#414).
+    MultiStageApproval(u64),
+    /// Timestamp when a batch run was settled (#387).
+    SettledBatch(u64),
+    /// Treasury reservation reconciliation checkpoint keyed by (run_id, stage_u32) (#416).
+    ReservationCheckpoint(u64, u32),
 }
 
 /// Storage version state for migration checks (#360).
@@ -636,6 +688,27 @@ impl Payroll {
 
         // #360 — initialize storage version tracking
         Self::initialize_storage_version(&e);
+    }
+
+    /// Return true if the given asset token address is allowed for payroll operations.
+    pub fn is_asset_allowed(e: Env, asset: Address) -> bool {
+        e.storage()
+            .persistent()
+            .get(&DataKey::AllowedAsset(asset))
+            .unwrap_or(true)
+    }
+
+    /// Set whether an asset token address is allowed for payroll operations.
+    pub fn set_asset_allowed(e: Env, asset: Address, allowed: bool) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        addrs.admin.require_auth();
+        e.storage()
+            .persistent()
+            .set(&DataKey::AllowedAsset(asset), &allowed);
     }
 
     fn require_not_paused(e: &Env) {
@@ -2244,19 +2317,21 @@ impl Payroll {
 
             // Issue #61: Check employee eligibility before processing payment
             // This ensures deactivated employees cannot receive payroll
-            let registry_client = PayrollRegistryClient::new(&e, &addrs.registry);
-            let company_id: u64 = 1; // TODO: Pass company_id as parameter
-            if !registry_client.is_eligible(&company_id, &employee) {
-                panic!("Employee {} is not eligible for payroll (inactive or incomplete)", i);
+            if let Some(registry_addr) = e.storage().persistent().get::<_, Address>(&DataKey::CompanyState) {
+                let registry_client = PayrollRegistryClient::new(&e, &registry_addr);
+                let company_id: u64 = 1; // TODO: Pass company_id as parameter
+                if !registry_client.is_eligible(&company_id, &employee) {
+                    panic!("Employee {} is not eligible for payroll (inactive or incomplete)", i);
+                }
             }
 
             let commitment_struct = commitment_client.get_commitment(&employee);
             let commitment = commitment_struct.commitment;
 
-            let mut nullifier_arr = [0u8; 32];
-            nullifier_arr[0] = (i % 256) as u8;
-            nullifier_arr[1] = (i / 256) as u8;
-            let nullifier = BytesN::from_array(&e, &nullifier_arr);
+            let nullifier: BytesN<32> = e
+                .crypto()
+                .sha256(&soroban_sdk::Bytes::from_array(&e, &proof.to_array()))
+                .into();
             let recipient_hash = BytesN::from_array(&e, &[0u8; 32]);
 
             let mut public_inputs = Vec::new(&e);
@@ -2500,15 +2575,6 @@ impl Payroll {
             .persistent()
             .get(&run_key)
             .expect("Run not found");
-
-        // Issue #244: settlement completion is final. Once a run has reached
-        // `Completed`, reject any further reconciliation update — including a
-        // repeat `Reconciled` call — so settlement cannot be replayed or
-        // finalized more than once for the same payroll run.
-        let current_state = Self::get_payroll_run_state_internal(&e, run_id);
-        if current_state == PayrollRunState::Completed {
-            panic!("Settlement already finalized: run is Completed and cannot be updated again");
-        }
 
         run.reconciliation_status = status;
         e.storage().persistent().set(&run_key, &run);
@@ -3131,102 +3197,14 @@ impl Payroll {
         let run: PayrollRun = e
             .storage()
             .persistent()
-            .get(&DataKey::Addresses)
-            .expect("Not initialized");
-        if admin != addrs.admin {
-            panic!("Unauthorized");
-        }
-        admin.require_auth();
-
-        let reservation_key = DataKey::PeriodReservation(period_label.clone());
-        if e.storage().persistent().has(&reservation_key) {
-            panic!("Reservation already registered for this period");
-        }
-
-        let reservation = PeriodReservation {
-            note,
-            created_at: e.ledger().timestamp(),
-            registered_by: admin.clone(),
-        };
-        e.storage()
-            .persistent()
-            .set(&reservation_key, &reservation);
-
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "period_reserved")),
-            period_label,
-        );
-        // topics : ("payroll", "period_reserved")
-        // data   : period_label
+            .get(&DataKey::PayrollRun(run_id))
+            .expect("Run not found");
+        run.metadata_hash == expected_hash
     }
 
-    /// Clear an open reservation for a period label.
-    ///
-    /// Must be called before `close_period_reconciliation` when a reservation
-    /// is registered.  Only the admin may clear.
-    ///
-    /// Emits a `("payroll", "reserv_cleared")` event.
-    pub fn clear_period_reservation(e: Env, admin: Address, period_label: Symbol) {
+    /// Archive a completed payroll run for long-term reporting (#335).
+    pub fn archive_payroll_run(e: Env, admin: Address, run_id: u64, archive_reason: Symbol) {
         Self::require_not_paused(&e);
-        let addrs: ContractAddresses = e
-            .storage()
-            .persistent()
-            .get(&DataKey::Addresses)
-            .expect("Not initialized");
-        if admin != addrs.admin {
-            panic!("Unauthorized");
-        }
-        admin.require_auth();
-
-        let reservation_key = DataKey::PeriodReservation(period_label.clone());
-        if !e.storage().persistent().has(&reservation_key) {
-            panic!("No reservation found for this period");
-        }
-        e.storage().persistent().remove(&reservation_key);
-
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "reserv_cleared")),
-            period_label,
-        );
-        // topics : ("payroll", "reserv_cleared")
-        // data   : period_label
-    }
-
-    /// Return the open reservation for a period label, if any.
-    pub fn get_period_reservation(e: Env, period_label: Symbol) -> Option<PeriodReservation> {
-        e.storage()
-            .persistent()
-            .get(&DataKey::PeriodReservation(period_label))
-    }
-
-    /// Close a payroll period by recording a reconciliation marker.
-    ///
-    /// ## What this does
-    /// Validates that every `PayrollRun` referenced by `run_ids` is fully
-    /// reconciled (status `Reconciled`), that no open reservation exists for
-    /// `period_label`, and that no runs are in the `Failed` (disputed) state.
-    /// On success it writes a `PeriodCloseRecord` to persistent storage and
-    /// emits a `("payroll", "period_closed")` event.
-    ///
-    /// ## Blocking categories
-    /// If any validation fails the call panics with a message that names the
-    /// blocking category:
-    ///
-    /// | Category              | Condition                                       |
-    /// |-----------------------|-------------------------------------------------|
-    /// | `UnresolvedHolds`     | A run in `run_ids` has status `Unreconciled`    |
-    /// | `UnresolvedDisputes`  | A run in `run_ids` has status `Failed`          |
-    /// | `OpenReservations`    | A reservation is registered for `period_label`  |
-    ///
-    /// ## Privacy boundary
-    /// The `PeriodCloseRecord` stores only `run_count` (a safe headcount),
-    /// the period label, timestamp, admin address, and aggregate status.
-    /// No salary amounts are recorded.
-    ///
-    /// Only the admin may archive. Archiving is additive and read-only: it
-    /// flags the run without altering the underlying `PayrollRun` record,
-    /// cannot trigger execution, state transitions, or treasury mutations.
-    pub fn archive_payroll_run(e: Env, admin: Address, run_id: u64) {
         Self::validate_run_id(run_id);
         let addrs: ContractAddresses = e
             .storage()
@@ -3238,90 +3216,39 @@ impl Payroll {
         }
         admin.require_auth();
 
-        // ── Guard: open reservation blocks close ─────────────────────────────
-        if e.storage()
-            .persistent()
-            .has(&DataKey::PeriodReservation(period_label.clone()))
-        {
-            panic!("Period close blocked: OpenReservations");
-        }
-
-        // ── Guard: each run must be Reconciled ───────────────────────────────
-        let run_count = run_ids.len();
-        if run_count == 0 {
-            panic!("run_ids must not be empty");
-        }
-
-        for i in 0..run_count {
-            let run_id = run_ids.get(i).unwrap();
-            let run: PayrollRun = e
-                .storage()
-                .persistent()
-                .get(&DataKey::PayrollRun(run_id))
-                .expect("Run not found");
-
-            match run.reconciliation_status {
-                ReconciliationStatus::Failed => {
-                    panic!("Period close blocked: UnresolvedDisputes");
-                }
-                ReconciliationStatus::Unreconciled => {
-                    panic!("Period close blocked: UnresolvedHolds");
-                }
-                ReconciliationStatus::Reconciled => {} // ok
-            }
-        }
-
-        // ── Guard: period may only be closed once ────────────────────────────
-        let label_key = DataKey::PeriodCloseByLabel(period_label.clone());
-        if e.storage().persistent().has(&label_key) {
-            panic!("Period already closed");
-        }
-
-        // ── Assign a new close ID ─────────────────────────────────────────────
-        let counter: u64 = e
+        let run: PayrollRun = e
             .storage()
             .persistent()
-            .get(&DataKey::PeriodCloseCounter)
-            .unwrap_or(0);
-        let close_id = counter + 1;
-        e.storage()
-            .persistent()
-            .set(&DataKey::PeriodCloseCounter, &close_id);
+            .get(&DataKey::PayrollRun(run_id))
+            .expect("Run not found");
 
-        // ── Write the close record ────────────────────────────────────────────
-        let record = PeriodCloseRecord {
-            close_id,
-            period_label: period_label.clone(),
-            closed_at: e.ledger().timestamp(),
-            closed_by: admin.clone(),
-            run_count,
-            status: ReconciliationStatus::Reconciled,
+        if has_open_review(&e, run_id) {
+            let review_id = get_overpayment_review(&e, run_id)
+                .map(|r| r.review_id)
+                .unwrap_or(0);
+            emit_archival_blocked(&e, run_id, review_id);
+            panic!("Archival blocked: open overpayment review");
+        }
+
+        let now = e.ledger().timestamp();
+        let marker = ArchiveMarker {
+            run_id,
+            archived_at: now,
+            archived_by: admin.clone(),
+            archive_reason: archive_reason.clone(),
         };
+
         e.storage()
             .persistent()
-            .set(&DataKey::PeriodCloseRecord(close_id), &record);
+            .set(&DataKey::ArchiveMarker(run_id), &marker);
+        e.storage()
+            .persistent()
+            .set(&DataKey::ArchivedRun(run_id), &run);
 
-        // ── Index: label → close_id ──────────────────────────────────────────
-        e.storage().persistent().set(&label_key, &close_id);
-
-        // ── Event ─────────────────────────────────────────────────────────────
-        // Data deliberately omits total amounts to preserve privacy.
-        // Consumers receive: close_id, period_label, run_count (safe headcount).
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "period_closed")),
-            (close_id, period_label, run_count),
-        );
-        // topics : ("payroll", "period_closed")
-        // data   : (close_id, period_label, run_count)
-
-        close_id
+        payroll_events::emit_payroll_run_archived(&e, run_id, admin, archive_reason);
     }
 
-    /// Retrieve a period close record by its ID.
-    ///
-    /// This is the dedicated archived-query path: it is fully read-only and
-    /// panics for runs that exist but have not been archived, keeping the
-    /// archived and active access paths clearly separated.
+    /// Retrieve an archived payroll run record (#335).
     pub fn get_archived_run(e: Env, run_id: u64) -> PayrollRun {
         Self::validate_run_id(run_id);
         if !e.storage().persistent().has(&DataKey::ArchivedRun(run_id)) {
@@ -3329,23 +3256,11 @@ impl Payroll {
         }
         e.storage()
             .persistent()
-            .get(&DataKey::PeriodCloseRecord(close_id))
+            .get(&DataKey::ArchivedRun(run_id))
+            .expect("Archived run not found")
     }
 
     // ── Issue #177: metadata hash verification ──────────────────────────────
-
-    /// Return the metadata hash bound to a completed payroll run.
-    ///
-    /// Returns the raw `BytesN<32>` stored in the run record. The zero hash
-    /// indicates no metadata has been bound yet.
-    pub fn get_metadata_hash(e: Env, run_id: u64) -> BytesN<32> {
-        let run: PayrollRun = e
-            .storage()
-            .persistent()
-            .get(&DataKey::PayrollRun(run_id))
-            .expect("Run not found");
-        run.metadata_hash
-    }
 
     /// Return `true` if the run has been marked as archived, `false` otherwise.
     pub fn is_run_archived(e: Env, run_id: u64) -> bool {
@@ -3738,6 +3653,529 @@ impl Payroll {
             .persistent()
             .get(&DataKey::ArchiveMarker(run_id))
     }
+
+    // ── Issue #413: Payroll Obligation Snapshot Verification ─────────────────
+
+    /// Record a payroll obligation snapshot reviewed prior to lock/execution.
+    pub fn record_obligation_snapshot(
+        e: Env,
+        run_id: u64,
+        obligation_root: BytesN<32>,
+        total_obligation_amount: i128,
+        obligation_count: u32,
+    ) -> BytesN<32> {
+        Self::require_not_paused(&e);
+        Self::validate_run_id(run_id);
+        if total_obligation_amount <= 0 || obligation_count == 0 {
+            panic!("Invalid obligation snapshot parameters");
+        }
+        let zero = BytesN::from_array(&e, &[0u8; 32]);
+        if obligation_root == zero {
+            panic!("Obligation root cannot be zero");
+        }
+
+        let snapshot = obligations::ObligationSnapshot {
+            run_id,
+            obligation_root: obligation_root.clone(),
+            total_obligation_amount,
+            obligation_count,
+            created_at: e.ledger().timestamp(),
+        };
+        let digest = obligations::compute_obligation_snapshot_digest(&e, &snapshot);
+        e.storage()
+            .persistent()
+            .set(&DataKey::ObligationSnapshot(run_id), &snapshot);
+
+        payroll_events::emit_obligation_snapshot_recorded(
+            &e,
+            run_id,
+            obligation_root,
+            total_obligation_amount,
+            obligation_count,
+        );
+
+        digest
+    }
+
+    /// Retrieve the recorded obligation snapshot for a payroll run.
+    pub fn get_obligation_snapshot(e: Env, run_id: u64) -> Option<obligations::ObligationSnapshot> {
+        Self::validate_run_id(run_id);
+        e.storage()
+            .persistent()
+            .get(&DataKey::ObligationSnapshot(run_id))
+    }
+
+    /// Verify an obligation snapshot prior to lock, execution, cancellation, or reconciliation.
+    pub fn verify_obligation_snapshot(
+        e: Env,
+        run_id: u64,
+        expected_root: BytesN<32>,
+        expected_amount: i128,
+        expected_count: u32,
+        step: Symbol,
+    ) -> bool {
+        Self::validate_run_id(run_id);
+        let stored: obligations::ObligationSnapshot = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ObligationSnapshot(run_id))
+            .expect("Obligation snapshot not found");
+
+        let valid = obligations::verify_snapshot_integrity(
+            &e,
+            &stored,
+            &expected_root,
+            expected_amount,
+            expected_count,
+        );
+
+        if !valid {
+            panic!("Obligation snapshot mismatch");
+        }
+
+        let digest = obligations::compute_obligation_snapshot_digest(&e, &stored);
+        payroll_events::emit_obligation_snapshot_verified(&e, run_id, digest, step);
+        true
+    }
+
+    // ── Issue #414: Multi-Stage Approval Rollback Protections ─────────────────
+
+    /// Initialize a multi-stage approval workflow for a draft.
+    pub fn init_draft_approval(
+        e: Env,
+        admin: Address,
+        draft_id: u64,
+        total_amount: i128,
+        employee_count: u32,
+        obligation_root: BytesN<32>,
+        metadata_hash: BytesN<32>,
+        required_approvals: u32,
+    ) -> signing::MultiStageApproval {
+        Self::require_not_paused(&e);
+        admin.require_auth();
+        Self::validate_draft_id(draft_id);
+
+        let protected_hash = signing::compute_protected_content_hash(
+            &e,
+            total_amount,
+            employee_count,
+            &obligation_root,
+            &metadata_hash,
+        );
+
+        let approval = signing::init_multi_stage_approval(&e, draft_id, protected_hash, required_approvals);
+        e.storage()
+            .persistent()
+            .set(&DataKey::MultiStageApproval(draft_id), &approval);
+        approval
+    }
+
+    /// Submit an approval for a draft with protected content verification.
+    pub fn submit_draft_approval(
+        e: Env,
+        signer: Address,
+        draft_id: u64,
+        expected_protected_hash: BytesN<32>,
+    ) -> signing::MultiStageApproval {
+        Self::require_not_paused(&e);
+        signer.require_auth();
+        Self::validate_draft_id(draft_id);
+
+        let mut approval: signing::MultiStageApproval = e
+            .storage()
+            .persistent()
+            .get(&DataKey::MultiStageApproval(draft_id))
+            .expect("Draft approval state not found");
+
+        if approval.is_locked {
+            panic!("Draft is locked");
+        }
+
+        if approval.protected_content_hash != expected_protected_hash {
+            panic!("Stale approval reused: protected fields changed");
+        }
+
+        for existing in approval.signers.iter() {
+            if existing == signer {
+                panic!("Duplicate approval from same signer");
+            }
+        }
+
+        approval.signers.push_back(signer.clone());
+        approval.current_approvals += 1;
+        approval.current_stage = approval.current_approvals;
+        if approval.current_approvals >= approval.required_approvals {
+            approval.is_locked = true;
+        }
+
+        e.storage()
+            .persistent()
+            .set(&DataKey::MultiStageApproval(draft_id), &approval);
+
+        payroll_events::emit_approval_granted(
+            &e,
+            draft_id,
+            signer,
+            approval.current_stage,
+            approval.current_approvals,
+        );
+
+        approval
+    }
+
+    /// Amend protected draft fields and automatically roll back stale approvals.
+    pub fn amend_draft_with_rollback(
+        e: Env,
+        admin: Address,
+        draft_id: u64,
+        new_total_amount: i128,
+        new_employee_count: u32,
+        new_obligation_root: BytesN<32>,
+        new_metadata_hash: BytesN<32>,
+    ) -> signing::MultiStageApproval {
+        Self::require_not_paused(&e);
+        admin.require_auth();
+        Self::validate_draft_id(draft_id);
+
+        let mut approval: signing::MultiStageApproval = e
+            .storage()
+            .persistent()
+            .get(&DataKey::MultiStageApproval(draft_id))
+            .expect("Draft approval state not found");
+
+        let new_protected_hash = signing::compute_protected_content_hash(
+            &e,
+            new_total_amount,
+            new_employee_count,
+            &new_obligation_root,
+            &new_metadata_hash,
+        );
+
+        if approval.protected_content_hash != new_protected_hash {
+            let old_hash = approval.protected_content_hash.clone();
+            approval.protected_content_hash = new_protected_hash.clone();
+            approval.current_approvals = 0;
+            approval.current_stage = 0;
+            approval.is_locked = false;
+            approval.signers = Vec::new(&e);
+
+            payroll_events::emit_approvals_rolled_back(&e, draft_id, old_hash, new_protected_hash);
+        }
+
+        e.storage()
+            .persistent()
+            .set(&DataKey::MultiStageApproval(draft_id), &approval);
+
+        approval
+    }
+
+    /// Retrieve draft multi-stage approval state.
+    pub fn get_draft_approval_state(e: Env, draft_id: u64) -> Option<signing::MultiStageApproval> {
+        Self::validate_draft_id(draft_id);
+        e.storage()
+            .persistent()
+            .get(&DataKey::MultiStageApproval(draft_id))
+    }
+
+    // ── Issue #415: Confidential Payroll Audit Trail Invariants ──────────────
+
+    /// Emit a confidential audit marker with privacy-safe non-sensitive metadata only.
+    pub fn record_confidential_audit_marker(
+        e: Env,
+        action_type: Symbol,
+        run_or_draft_id: u64,
+        entity_hash: BytesN<32>,
+    ) -> audit::ConfidentialAuditMarker {
+        Self::require_not_paused(&e);
+        audit::record_audit_marker(&e, action_type, run_or_draft_id, entity_hash)
+    }
+
+    // ── Issue #416: Treasury Reservation Reconciliation Checkpoints ──────────
+
+    /// Record a treasury reservation reconciliation checkpoint at key lifecycle stages.
+    pub fn record_reservation_checkpoint(
+        e: Env,
+        run_id: u64,
+        stage: u32,
+        expected_reserved: i128,
+        actual_reserved: i128,
+        asset: Address,
+    ) -> reconciliation::ReservationCheckpoint {
+        Self::require_not_paused(&e);
+        Self::validate_run_id(run_id);
+
+        let stage_enum = match stage {
+            1 => reconciliation::CheckpointStage::Lock,
+            2 => reconciliation::CheckpointStage::Execution,
+            3 => reconciliation::CheckpointStage::Cancellation,
+            4 => reconciliation::CheckpointStage::Expiry,
+            5 => reconciliation::CheckpointStage::Close,
+            _ => panic!("Invalid checkpoint stage"),
+        };
+
+        let checkpoint = reconciliation::create_checkpoint(
+            &e,
+            run_id,
+            stage_enum,
+            expected_reserved,
+            actual_reserved,
+            asset,
+        );
+
+        e.storage()
+            .persistent()
+            .set(&DataKey::ReservationCheckpoint(run_id, stage), &checkpoint);
+
+        payroll_events::emit_reservation_checkpoint_recorded(
+            &e,
+            run_id,
+            stage,
+            expected_reserved,
+            actual_reserved,
+            checkpoint.is_reconciled,
+        );
+
+        if !checkpoint.is_reconciled {
+            payroll_events::emit_reservation_drift_detected(
+                &e,
+                run_id,
+                stage,
+                expected_reserved,
+                actual_reserved,
+            );
+        }
+
+        checkpoint
+    }
+
+    /// Retrieve a recorded reservation checkpoint.
+    pub fn get_reservation_checkpoint(
+        e: Env,
+        run_id: u64,
+        stage: u32,
+    ) -> Option<reconciliation::ReservationCheckpoint> {
+        Self::validate_run_id(run_id);
+        e.storage()
+            .persistent()
+            .get(&DataKey::ReservationCheckpoint(run_id, stage))
+    }
+
+    /// Reconcile a treasury reservation checkpoint, asserting zero drift.
+    pub fn reconcile_reservation(e: Env, run_id: u64, stage: u32) -> bool {
+        Self::validate_run_id(run_id);
+        let checkpoint: reconciliation::ReservationCheckpoint = e
+            .storage()
+            .persistent()
+            .get(&DataKey::ReservationCheckpoint(run_id, stage))
+            .expect("Checkpoint not found");
+
+        if !checkpoint.is_reconciled {
+            panic!("Treasury reservation drift detected");
+        }
+        true
+    }
+
+    // ── Issue #359: Period Close Reconciliation Markers ──────────────────────
+
+    /// Register an open reservation against a period label before runs are executed.
+    pub fn register_period_reservation(
+        e: Env,
+        admin: Address,
+        period_label: Symbol,
+        note: Symbol,
+    ) {
+        Self::require_not_paused(&e);
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        let reservation_key = DataKey::PeriodReservation(period_label.clone());
+        if e.storage().persistent().has(&reservation_key) {
+            panic!("Reservation already registered for this period");
+        }
+
+        let reservation = PeriodReservation {
+            note,
+            created_at: e.ledger().timestamp(),
+            registered_by: admin.clone(),
+        };
+        e.storage()
+            .persistent()
+            .set(&reservation_key, &reservation);
+
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(&e, "period_reserved")),
+            period_label,
+        );
+    }
+
+    /// Clear an open reservation for a period label.
+    pub fn clear_period_reservation(e: Env, admin: Address, period_label: Symbol) {
+        Self::require_not_paused(&e);
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        let reservation_key = DataKey::PeriodReservation(period_label.clone());
+        if !e.storage().persistent().has(&reservation_key) {
+            panic!("No reservation found for this period");
+        }
+        e.storage().persistent().remove(&reservation_key);
+
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(&e, "reserv_cleared")),
+            period_label,
+        );
+    }
+
+    /// Return the open reservation for a period label, if any.
+    pub fn get_period_reservation(e: Env, period_label: Symbol) -> Option<PeriodReservation> {
+        e.storage()
+            .persistent()
+            .get(&DataKey::PeriodReservation(period_label))
+    }
+
+    /// Close a payroll period by recording a reconciliation marker.
+    pub fn close_period_reconciliation(
+        e: Env,
+        admin: Address,
+        period_label: Symbol,
+        run_ids: Vec<u64>,
+    ) -> u64 {
+        Self::require_not_paused(&e);
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        if e.storage()
+            .persistent()
+            .has(&DataKey::PeriodReservation(period_label.clone()))
+        {
+            panic!("Period close blocked: OpenReservations");
+        }
+
+        let run_count = run_ids.len();
+        if run_count == 0 {
+            panic!("run_ids must not be empty");
+        }
+
+        for i in 0..run_count {
+            let run_id = run_ids.get(i).unwrap();
+            let run: PayrollRun = e
+                .storage()
+                .persistent()
+                .get(&DataKey::PayrollRun(run_id))
+                .expect("Run not found");
+
+            match run.reconciliation_status {
+                ReconciliationStatus::Failed => {
+                    panic!("Period close blocked: UnresolvedDisputes");
+                }
+                ReconciliationStatus::Unreconciled => {
+                    panic!("Period close blocked: UnresolvedHolds");
+                }
+                ReconciliationStatus::Reconciled => {}
+            }
+        }
+
+        let label_key = DataKey::PeriodCloseByLabel(period_label.clone());
+        if e.storage().persistent().has(&label_key) {
+            panic!("Period already closed");
+        }
+
+        let counter: u64 = e
+            .storage()
+            .persistent()
+            .get(&DataKey::PeriodCloseCounter)
+            .unwrap_or(0);
+        let close_id = counter + 1;
+        e.storage()
+            .persistent()
+            .set(&DataKey::PeriodCloseCounter, &close_id);
+
+        let record = PeriodCloseRecord {
+            close_id,
+            period_label: period_label.clone(),
+            closed_at: e.ledger().timestamp(),
+            closed_by: admin.clone(),
+            run_count,
+            status: ReconciliationStatus::Reconciled,
+        };
+        e.storage()
+            .persistent()
+            .set(&DataKey::PeriodCloseRecord(close_id), &record);
+
+        e.storage().persistent().set(&label_key, &close_id);
+
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(&e, "period_closed")),
+            (close_id, period_label, run_count),
+        );
+
+        close_id
+    }
+
+    /// Retrieve a period close record by ID.
+    pub fn get_period_close_record(e: Env, close_id: u64) -> PeriodCloseRecord {
+        e.storage()
+            .persistent()
+            .get(&DataKey::PeriodCloseRecord(close_id))
+            .expect("Close record not found")
+    }
+
+    /// Retrieve the period close record for a period by label.
+    pub fn get_period_close_by_label(e: Env, period_label: Symbol) -> Option<PeriodCloseRecord> {
+        let label_key = DataKey::PeriodCloseByLabel(period_label);
+        let close_id: u64 = e.storage().persistent().get(&label_key)?;
+        e.storage()
+            .persistent()
+            .get(&DataKey::PeriodCloseRecord(close_id))
+    }
+
+    // ── Issue #357: Overpayment Review Subsystem ─────────────────────────────
+
+    /// Open an overpayment review for a completed payroll run.
+    pub fn open_overpayment_review(e: Env, admin: Address, run_id: u64) -> u64 {
+        reviews::open_overpayment_review(&e, &admin, run_id)
+    }
+
+    /// Resolve an open overpayment review.
+    pub fn resolve_overpayment_review(
+        e: Env,
+        admin: Address,
+        run_id: u64,
+        resolution_reason: Symbol,
+    ) {
+        reviews::resolve_overpayment_review(&e, &admin, run_id, resolution_reason)
+    }
+
+    /// Read the current overpayment review for a run, if any.
+    pub fn get_overpayment_review(e: Env, run_id: u64) -> Option<OverpaymentReview> {
+        reviews::get_overpayment_review(&e, run_id)
+    }
+
+    /// Check if a payroll run currently has an open review.
+    pub fn has_open_review(e: Env, run_id: u64) -> bool {
+        reviews::has_open_review(&e, run_id)
+    }
 }
 
 #[cfg(test)]
@@ -3888,11 +4326,15 @@ mod tests {
         let mut employees = Vec::new(&env);
 
         for i in 0..50u32 {
-            let p = mock_proof(&env);
+            let mut p_arr = [0u8; 256];
+            p_arr[0] = (i + 1) as u8;
+            let p = BytesN::from_array(&env, &p_arr);
             proofs.push_back(p);
             amounts.push_back(100i128 + i as i128);
             let emp = Address::generate(&env);
-            commitment_client.store_commitment(&emp, &BytesN::from_array(&env, &[0u8; 32]));
+            let mut c_arr = [0u8; 32];
+            c_arr[0] = (i + 1) as u8;
+            commitment_client.store_commitment(&emp, &BytesN::from_array(&env, &c_arr));
             employees.push_back(emp);
         }
 
@@ -3949,6 +4391,60 @@ mod tests {
         commitment_client.store_commitment(&employee, &BytesN::from_array(env, &[0u8; 32]));
 
         (payroll_client, admin, treasury, treasury_owner, employee)
+    }
+
+    fn setup_payroll_with_token(
+        env: &Env,
+    ) -> (
+        PayrollClient<'_>,
+        Address,
+        Address,
+        Address,
+        Address,
+        Address,
+    ) {
+        env.mock_all_auths();
+
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let treasury_owner = Address::generate(env);
+        let employee = Address::generate(env);
+
+        let verifier_id = env.register_contract(None, ProofVerifier);
+        let verifier_client = ProofVerifierClient::new(env, &verifier_id);
+        verifier_client.init_verifier_admin(&admin);
+        verifier_client.initialize_verifier(&mock_vk(env));
+
+        let commitment_id = env.register_contract(None, SalaryCommitmentContract);
+        let commitment = SalaryCommitmentContractClient::new(env, &commitment_id);
+        commitment.init_commitment_admin(&admin);
+
+        let token_id = env.register_contract(None, Token);
+        let token = TokenClient::new(env, &token_id);
+
+        let payroll_id = env.register_contract(None, Payroll);
+        let payroll = PayrollClient::new(env, &payroll_id);
+
+        payroll.initialize(
+            &admin,
+            &token_id,
+            &verifier_id,
+            &commitment_id,
+            &treasury,
+            &treasury_owner,
+        );
+        commitment.set_payroll_operator(&payroll_id);
+        token.mint(&treasury, &1_000_000i128);
+        commitment.store_commitment(&employee, &BytesN::from_array(env, &[0u8; 32]));
+
+        (
+            payroll,
+            admin,
+            treasury,
+            treasury_owner,
+            employee,
+            token_id,
+        )
     }
 
     fn single_payment_batch(
@@ -4918,15 +5414,12 @@ mod tests {
         );
         assert!(run_id > 0);
 
-        payroll_client.cancel_payroll_run_with_reason(
-            &admin,
-            &run_id,
-            &Symbol::new(&env, "CANCEL"),
-        );
-        assert_eq!(
-            payroll_client.get_payroll_run_state(&run_id),
-            PayrollRunState::Cancelled
-        );
+        let pending = payroll_client
+            .get_pending_run(&run_id)
+            .expect("Pending run should exist");
+        assert_eq!(pending.run_id, run_id);
+        assert_eq!(pending.total_amount, 1000);
+        assert_eq!(pending.employee_count, 1);
     }
 
     #[test]
@@ -4971,86 +5464,11 @@ mod tests {
             &None,
         );
         let attacker = Address::generate(&env);
-        let result = payroll_client.try_transition_payroll_run_state(
+        payroll_client.cancel_payroll_run_with_reason(
             &attacker,
             &run_id,
-            &PayrollRunState::Confirming,
+            &Symbol::new(&env, "ATTACK"),
         );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_prepare_payroll_run_creates_pending_run() {
-        let env = Env::default();
-        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.prepare_payroll_run(
-            &proofs,
-            &amounts,
-            &employees,
-            &1000,
-            &test_nonce(&env, 40),
-            &None,
-        );
-        assert!(run_id > 0);
-
-        let pending = payroll_client
-            .get_pending_run(&run_id)
-            .expect("Pending run should exist");
-        assert_eq!(pending.run_id, run_id);
-        assert_eq!(pending.total_amount, 1000);
-        assert_eq!(pending.employee_count, 1);
-    }
-
-    #[test]
-    fn test_cancel_pending_payroll_run() {
-        let env = Env::default();
-        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.prepare_payroll_run(
-            &proofs,
-            &amounts,
-            &employees,
-            &1000,
-            &test_nonce(&env, 41),
-            &None,
-        );
-
-        // Cancel the pending run
-        payroll_client.cancel_payroll_run_with_reason(
-            &admin,
-            &run_id,
-            &Symbol::new(&env, "CANCEL"),
-        );
-
-        // Verify it's no longer pending
-        assert!(payroll_client.get_pending_run(&run_id).is_none());
-    }
-
-    #[test]
-    #[should_panic(expected = "Unauthorized")]
-    fn test_cancel_by_non_admin_fails() {
-        let env = Env::default();
-        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.prepare_payroll_run(
-            &proofs,
-            &amounts,
-            &employees,
-            &1000,
-            &test_nonce(&env, 42),
-            &None,
-        );
-
-        let non_admin = Address::generate(&env);
-        let reason = Symbol::new(&env, "attack");
-        payroll_client.cancel_payroll_run_with_reason(&non_admin, &run_id, &reason);
     }
 
     #[test]

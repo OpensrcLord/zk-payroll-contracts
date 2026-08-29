@@ -186,6 +186,24 @@ pub enum StateError {
     EmployeeIneligible = 507,
     /// The compliance hold blocks this payroll operation.
     ComplianceHoldActive = 508,
+    /// Provided obligation snapshot digest or fields do not match the stored snapshot (#413).
+    ObligationSnapshotMismatch = 509,
+    /// Obligation snapshot is missing for a run requiring verification (#413).
+    ObligationSnapshotNotFound = 510,
+    /// Invalid parameters in obligation snapshot (#413).
+    InvalidObligationSnapshot = 511,
+    /// Attempt to use an approval granted for a previous version of protected fields (#414).
+    StaleApprovalReused = 512,
+    /// Editing a draft rolled back partial approvals (#414).
+    PartialApprovalRollback = 513,
+    /// Approval state is inconsistent or mixed (#414).
+    MixedApprovalState = 514,
+    /// Protected fields changed and full re-approval is required (#414).
+    ReapprovalRequired = 515,
+    /// Treasury reserved balance does not match batch obligations at checkpoint (#416).
+    ReservationDriftDetected = 516,
+    /// Reconciliation checkpoint was not found (#416).
+    CheckpointNotFound = 517,
 }
 
 /// Replay Protection and Idempotency Errors (600-699)

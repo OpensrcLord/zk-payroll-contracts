@@ -1103,6 +1103,8 @@ fn test_respond_to_challenge_rejection_does_not_require_a_proof_reference() {
     });
 
     assert!(result.is_ok());
+}
+
 // ── Issue #330: Deterministic audit attestation digest builder tests ──────────
 
 #[test]

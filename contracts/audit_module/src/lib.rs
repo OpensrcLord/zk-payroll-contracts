@@ -31,6 +31,8 @@ pub enum AuditError {
     InvalidViewKey = 7,
     /// The requested new expiration is not later than the current one.
     ExpirationNotExtended = 8,
+    /// The auditor list supplied to `prune_expired_grants` exceeds the maximum batch size.
+    PruneBatchTooLarge = 9,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +120,18 @@ pub struct AuditMetadataSummary {
     pub verification_fail_count: u32,
     pub exported_at: u64,
     pub exported_by: Address,
+}
+
+// ── Issue #356: stale audit grant pruning ────────────────────────────────────
+
+/// Tombstone written to Persistent storage when a stale grant is pruned.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrunedGrantRef {
+    pub key_digest: BytesN<32>,
+    pub expired_at_ledger: u32,
+    pub pruned_at_ledger: u32,
+    pub pruned_at_timestamp: u64,
 }
 
 // ── Issue #330: deterministic audit attestation digest builder ──────────────
