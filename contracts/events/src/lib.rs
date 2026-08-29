@@ -27,9 +27,10 @@ use soroban_sdk::{symbol_short, Address, BytesN, Env, Symbol};
 
 /// Pause category symbols for event emission.
 /// Defined here to avoid circular dependency with pause_manager.
+#[allow(dead_code)]
 mod pause_category_symbols {
     use soroban_sdk::{Env, Symbol};
-    
+
     pub fn payroll(e: &Env) -> Symbol {
         Symbol::new(e, "payroll")
     }
@@ -736,7 +737,10 @@ pub fn emit_unpaused(e: &Env) {
 /// Emitted when a specific category is paused.
 pub fn emit_category_paused(e: &Env, category_symbol: Symbol) {
     e.events().publish(
-        (Symbol::new(e, "PauseManager"), Symbol::new(e, "category_paused")),
+        (
+            Symbol::new(e, "PauseManager"),
+            Symbol::new(e, "category_paused"),
+        ),
         (category_symbol,),
     );
 }
@@ -744,7 +748,10 @@ pub fn emit_category_paused(e: &Env, category_symbol: Symbol) {
 /// Emitted when a specific category is unpaused.
 pub fn emit_category_unpaused(e: &Env, category_symbol: Symbol) {
     e.events().publish(
-        (Symbol::new(e, "PauseManager"), Symbol::new(e, "category_unpaused")),
+        (
+            Symbol::new(e, "PauseManager"),
+            Symbol::new(e, "category_unpaused"),
+        ),
         (category_symbol,),
     );
 }

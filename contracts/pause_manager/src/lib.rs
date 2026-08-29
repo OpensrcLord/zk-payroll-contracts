@@ -49,8 +49,15 @@ impl PauseManager {
             panic!("Already initialized");
         }
         e.storage().persistent().set(&DataKey::Operator, &operator);
-        for category in [PauseCategory::Payroll, PauseCategory::Treasury, PauseCategory::Audit, PauseCategory::Admin] {
-            e.storage().persistent().set(&DataKey::Paused(category), &false);
+        for category in [
+            PauseCategory::Payroll,
+            PauseCategory::Treasury,
+            PauseCategory::Audit,
+            PauseCategory::Admin,
+        ] {
+            e.storage()
+                .persistent()
+                .set(&DataKey::Paused(category), &false);
         }
         payroll_events::emit_pause_manager_initialized(&e, operator);
     }
@@ -62,8 +69,15 @@ impl PauseManager {
             .get(&DataKey::Operator)
             .expect("Not initialized");
         operator.require_auth();
-        for category in [PauseCategory::Payroll, PauseCategory::Treasury, PauseCategory::Audit, PauseCategory::Admin] {
-            e.storage().persistent().set(&DataKey::Paused(category), &true);
+        for category in [
+            PauseCategory::Payroll,
+            PauseCategory::Treasury,
+            PauseCategory::Audit,
+            PauseCategory::Admin,
+        ] {
+            e.storage()
+                .persistent()
+                .set(&DataKey::Paused(category), &true);
         }
         payroll_events::emit_paused(&e);
     }
@@ -75,8 +89,15 @@ impl PauseManager {
             .get(&DataKey::Operator)
             .expect("Not initialized");
         operator.require_auth();
-        for category in [PauseCategory::Payroll, PauseCategory::Treasury, PauseCategory::Audit, PauseCategory::Admin] {
-            e.storage().persistent().set(&DataKey::Paused(category), &false);
+        for category in [
+            PauseCategory::Payroll,
+            PauseCategory::Treasury,
+            PauseCategory::Audit,
+            PauseCategory::Admin,
+        ] {
+            e.storage()
+                .persistent()
+                .set(&DataKey::Paused(category), &false);
         }
         payroll_events::emit_unpaused(&e);
     }
@@ -88,7 +109,9 @@ impl PauseManager {
             .get(&DataKey::Operator)
             .expect("Not initialized");
         operator.require_auth();
-        e.storage().persistent().set(&DataKey::Paused(category), &true);
+        e.storage()
+            .persistent()
+            .set(&DataKey::Paused(category), &true);
         let category_symbol = match category {
             PauseCategory::Payroll => Symbol::new(&e, "payroll"),
             PauseCategory::Treasury => Symbol::new(&e, "treasury"),
@@ -105,7 +128,9 @@ impl PauseManager {
             .get(&DataKey::Operator)
             .expect("Not initialized");
         operator.require_auth();
-        e.storage().persistent().set(&DataKey::Paused(category), &false);
+        e.storage()
+            .persistent()
+            .set(&DataKey::Paused(category), &false);
         let category_symbol = match category {
             PauseCategory::Payroll => Symbol::new(&e, "payroll"),
             PauseCategory::Treasury => Symbol::new(&e, "treasury"),
@@ -116,7 +141,12 @@ impl PauseManager {
     }
 
     pub fn is_paused(e: Env) -> bool {
-        for category in [PauseCategory::Payroll, PauseCategory::Treasury, PauseCategory::Audit, PauseCategory::Admin] {
+        for category in [
+            PauseCategory::Payroll,
+            PauseCategory::Treasury,
+            PauseCategory::Audit,
+            PauseCategory::Admin,
+        ] {
             if e.storage()
                 .persistent()
                 .get(&DataKey::Paused(category))
@@ -137,19 +167,23 @@ impl PauseManager {
 
     pub fn get_pause_status(e: Env) -> PauseStatus {
         PauseStatus {
-            payroll_paused: e.storage()
+            payroll_paused: e
+                .storage()
                 .persistent()
                 .get(&DataKey::Paused(PauseCategory::Payroll))
                 .unwrap_or(false),
-            treasury_paused: e.storage()
+            treasury_paused: e
+                .storage()
                 .persistent()
                 .get(&DataKey::Paused(PauseCategory::Treasury))
                 .unwrap_or(false),
-            audit_paused: e.storage()
+            audit_paused: e
+                .storage()
                 .persistent()
                 .get(&DataKey::Paused(PauseCategory::Audit))
                 .unwrap_or(false),
-            admin_paused: e.storage()
+            admin_paused: e
+                .storage()
                 .persistent()
                 .get(&DataKey::Paused(PauseCategory::Admin))
                 .unwrap_or(false),
