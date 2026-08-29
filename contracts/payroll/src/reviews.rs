@@ -112,6 +112,20 @@ pub enum ReviewDataKey {
 /// Emits `("payroll", "review_opened")` with `(review_id, run_id, flagged_at)`.
 /// No salary amounts or employee addresses are included.
 pub fn open_overpayment_review(env: &Env, admin: &Address, run_id: u64) -> u64 {
+    let addrs: crate::ContractAddresses = env
+        .storage()
+        .persistent()
+        .get(&crate::DataKey::Addresses)
+        .expect("Not initialized");
+    if *admin != addrs.admin {
+        panic!("Unauthorized");
+    }
+    admin.require_auth();
+
+    if !env.storage().persistent().has(&crate::DataKey::PayrollRun(run_id)) {
+        panic!("Run not found");
+    }
+
     // Guard: an open review must not already exist for this run.
     if let Some(existing) = env
         .storage()
@@ -186,6 +200,15 @@ pub fn resolve_overpayment_review(
     run_id: u64,
     reason: Symbol,
 ) {
+    let addrs: crate::ContractAddresses = env
+        .storage()
+        .persistent()
+        .get(&crate::DataKey::Addresses)
+        .expect("Not initialized");
+    if *admin != addrs.admin {
+        panic!("Unauthorized");
+    }
+    admin.require_auth();
     // Enforce non-empty reason.
     {
         // Soroban symbols do not implement `is_empty()` on `no_std`.

@@ -912,6 +912,39 @@ fn case_run_changes_requested(env: &Env, cid: &Address, out: &mut SchemaMap) {
     );
 }
 
+fn case_reservation_created(env: &Env, cid: &Address, out: &mut SchemaMap) {
+    let asset = Address::generate(env);
+    let reserved_amount: i128 = 5_000;
+    let expires_at: u64 = 86_400;
+    env.as_contract(cid, || {
+        payroll_events::emit_reservation_created(env, asset.clone(), reserved_amount, expires_at);
+    });
+    let (_, topics, data) = last_event(env);
+    assert_eq!(
+        topics,
+        topic(env, "reservation_created"),
+        "payroll.reservation_created topics changed"
+    );
+    let decoded: (Address, i128, u64) = data.try_into_val(env).unwrap();
+    assert_eq!(
+        decoded,
+        (asset, reserved_amount, expires_at),
+        "payroll.reservation_created payload changed"
+    );
+    out.insert(
+        "payroll.reservation_created".to_string(),
+        EventSchema {
+            schema_version: 1,
+            topics: vec![sym("payroll"), sym("reservation_created")],
+            data: vec![
+                field("asset", "Address"),
+                field("reserved_amount", "i128"),
+                field("expires_at", "u64"),
+            ],
+        },
+    );
+}
+
 #[test]
 fn payroll_events_match_fixture() {
     let (env, cid) = new_env();
@@ -948,6 +981,7 @@ fn payroll_events_match_fixture() {
     case_run_approved(&env, &cid, &mut observed);
     case_run_rejected(&env, &cid, &mut observed);
     case_run_changes_requested(&env, &cid, &mut observed);
+    case_reservation_created(&env, &cid, &mut observed);
 
     assert_matches_fixture(
         "payroll",

@@ -96,7 +96,7 @@ pub struct ChallengeResponse {
     /// the rejection reason hash.
     pub proof_reference_hash: soroban_sdk::BytesN<32>,
     /// Optional reason if the challenge was rejected.
-    pub rejection_reason: soroban_sdk::Option<soroban_sdk::String>,
+    pub rejection_reason: Option<soroban_sdk::String>,
     /// Unix timestamp when the response was submitted.
     pub responded_at: u64,
 }
@@ -131,6 +131,18 @@ pub enum ChallengeDataKey {
 /// - `UnauthorizedAuditor` — caller is not an authorized auditor
 /// - `InsufficientAuditScope` — auditor scope doesn't cover this period/company
 /// - `InvalidChallenge` — invalid deadline or parameters
+/// Validates that a proof reference identifier is well-formed (#389).
+///
+/// This only checks the reference's *format* — that it is not the empty/
+/// all-zero sentinel — never anything about what the referenced proof
+/// actually attests to. Keeping it a free function (rather than inline in
+/// `respond_to_challenge`) keeps that boundary explicit and lets it be
+/// exercised directly in tests.
+pub fn is_valid_proof_reference(env: &Env, proof_reference_hash: &soroban_sdk::BytesN<32>) -> bool {
+    let zero = soroban_sdk::BytesN::from_array(env, &[0u8; 32]);
+    proof_reference_hash != &zero
+}
+
 pub fn create_challenge(
     env: &Env,
     company_id: Symbol,
@@ -149,7 +161,7 @@ pub fn create_challenge(
     }
 
     // Allocate new challenge ID
-    let counter_key = ChallengeDataKey::ChallengeCounter(company_id);
+    let counter_key = ChallengeDataKey::ChallengeCounter(company_id.clone());
     let challenge_counter: ChallengeId = env
         .storage()
         .persistent()
@@ -159,7 +171,7 @@ pub fn create_challenge(
 
     let challenge = AuditChallenge {
         challenge_id: new_challenge_id,
-        company_id,
+        company_id: company_id.clone(),
         auditor: auditor.clone(),
         payroll_period,
         batch_commitment_hash,
@@ -171,7 +183,7 @@ pub fn create_challenge(
     };
 
     // Persist challenge
-    let challenge_key = ChallengeDataKey::Challenge(company_id, new_challenge_id);
+    let challenge_key = ChallengeDataKey::Challenge(company_id.clone(), new_challenge_id);
     env.storage().persistent().set(&challenge_key, &challenge);
 
     // Update counter
@@ -212,9 +224,9 @@ pub fn respond_to_challenge(
     challenge_id: ChallengeId,
     responder: Address,
     proof_reference_hash: soroban_sdk::BytesN<32>,
-    rejection_reason: soroban_sdk::Option<soroban_sdk::String>,
+    rejection_reason: Option<soroban_sdk::String>,
 ) -> Result<(), AuditError> {
-    let challenge_key = ChallengeDataKey::Challenge(company_id, challenge_id);
+    let challenge_key = ChallengeDataKey::Challenge(company_id.clone(), challenge_id);
 
     // Retrieve challenge
     let mut challenge: AuditChallenge = env
@@ -233,7 +245,7 @@ pub fn respond_to_challenge(
     }
 
     // Check if already responded
-    let response_key = ChallengeDataKey::ChallengeResponse(company_id, challenge_id);
+    let response_key = ChallengeDataKey::ChallengeResponse(company_id.clone(), challenge_id);
     if env.storage().persistent().has(&response_key) {
         return Err(AuditError::ChallengeAlreadyResolved);
     }
@@ -242,13 +254,19 @@ pub fn respond_to_challenge(
     if rejection_reason.is_some() {
         challenge.status = ChallengeStatus::Rejected;
     } else {
+        // An accepting response must carry a real proof reference — reject
+        // it early, independent of whatever the referenced proof actually
+        // verifies to (that's proof_verifier's job, not this module's).
+        if !is_valid_proof_reference(env, &proof_reference_hash) {
+            return Err(AuditError::InvalidProofReference);
+        }
         challenge.status = ChallengeStatus::Responded;
     }
 
     // Create response record
     let response = ChallengeResponse {
         challenge_id,
-        company_id,
+        company_id: company_id.clone(),
         responded_by: responder.clone(),
         proof_reference_hash,
         rejection_reason: rejection_reason.clone(),
