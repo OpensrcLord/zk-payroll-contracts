@@ -312,6 +312,47 @@ pub struct ArchiveMarker {
     pub archive_reason: Symbol,
 }
 
+// ── Issue #402: Safe Treasury Balance Summary ──────────────────────────────────
+
+/// Safe treasury balance summary by asset (#402).
+///
+/// Provides aggregate treasury balance visibility (total on-chain balance,
+/// locked/reserved funds for pending payroll, blocked funds under compliance holds,
+/// and available unencumbered balance) without exposing private employee rows.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafeTreasurySummary {
+    pub asset: Address,
+    pub total_balance: i128,
+    pub available_balance: i128,
+    pub reserved_balance: i128,
+    pub blocked_balance: i128,
+}
+
+// ── Issue #404: Cancelled Batch Read Status ────────────────────────────────────
+
+/// Safe metadata for a cancelled payroll batch (#404).
+///
+/// Allows clients, audit logs, and status dashboards to inspect cancellation
+/// details without exposing private payroll row details.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CancelledBatchStatus {
+    pub run_id: u64,
+    pub cancelled_at: u64,
+    pub cancelled_by: Address,
+    pub reason: Symbol,
+    pub employee_count: u32,
+    pub total_amount: i128,
+    pub draft_hash: BytesN<32>,
+    pub is_cancelled: bool,
+}
+
+// ── Issue #403: Payroll Approval Expiry ────────────────────────────────────────
+
+/// Default maximum validity age for reviewer approvals (7 days in seconds) (#403).
+pub const DEFAULT_APPROVAL_EXPIRY_SECONDS: u64 = 7 * 24 * 60 * 60;
+
 // ── Issue #147: company lifecycle state ──────────────────────────────────────────
 
 /// Lifecycle state of the company operating this payroll contract.
@@ -483,6 +524,8 @@ pub enum DataKey {
     StorageVersion,
     /// Migration readiness status for sensitive operations (#360).
     MigrationReadiness,
+    /// Cancelled payroll batch status record (#404).
+    CancelledBatchRecord(u64),
     // Future upgrade example (issue #196):
     // PayrollRunV2(u64),  // Would be added here when schema evolution is needed
 }
@@ -2102,6 +2145,9 @@ impl Payroll {
             .get(&pending_key)
             .expect("Pending run not found");
 
+        // Validate approval expiry if a review exists (#403)
+        Self::validate_approval_not_expired(&e, run_id, DEFAULT_APPROVAL_EXPIRY_SECONDS);
+
         // Issue #218: Check if run has already been finalized
         // Once a run is executed, it cannot be cancelled
         let run_key = DataKey::PayrollRun(run_id);
@@ -2178,6 +2224,21 @@ impl Payroll {
 
         // Release locked funds reservation (#343)
         Self::subtract_locked_funds(&e, addrs.token.clone(), pending_run.total_amount);
+
+        // Store safe cancellation metadata (#404)
+        let cancel_status = CancelledBatchStatus {
+            run_id,
+            cancelled_at: e.ledger().timestamp(),
+            cancelled_by: admin.clone(),
+            reason: reason.clone(),
+            employee_count: pending_run.employee_count,
+            total_amount: pending_run.total_amount,
+            draft_hash: pending_run.draft_hash.clone(),
+            is_cancelled: true,
+        };
+        e.storage()
+            .persistent()
+            .set(&DataKey::CancelledBatchRecord(run_id), &cancel_status);
 
         // Remove the pending run from storage if present
         e.storage().persistent().remove(&pending_key);
@@ -3603,6 +3664,105 @@ impl Payroll {
             .persistent()
             .get(&DataKey::ArchiveMarker(run_id))
     }
+
+    // ── Issue #401: Batch Lock Timestamp Query Helper ────────────────────────
+
+    /// Return the timestamp at which a payroll batch reached locked state (#401).
+    ///
+    /// A batch is in a locked state when funds have been reserved and it is awaiting
+    /// execution or has already been executed.
+    /// - If the batch is in a pending run state (`PendingRun(run_id)`), its `prepared_at` timestamp is returned.
+    /// - If the batch has been executed (`PayrollRun(run_id)`), its `executed_at` timestamp is returned.
+    /// - If the batch does not exist or has not been locked, `None` is returned.
+    pub fn get_batch_lock_timestamp(e: Env, run_id: u64) -> Option<u64> {
+        if let Some(pending) = e
+            .storage()
+            .persistent()
+            .get::<_, PendingPayrollRun>(&DataKey::PendingRun(run_id))
+        {
+            return Some(pending.prepared_at);
+        }
+        if let Some(run) = e
+            .storage()
+            .persistent()
+            .get::<_, PayrollRun>(&DataKey::PayrollRun(run_id))
+        {
+            return Some(run.executed_at);
+        }
+        None
+    }
+
+    // ── Issue #402: Safe Treasury Balance Summary View ───────────────────────
+
+    /// Return aggregate treasury balance summary for a given asset token (#402).
+    ///
+    /// Returns the total balance held at the treasury address, the reserved/locked
+    /// balance allocated to pending payroll runs, blocked balances, and the net
+    /// available balance without disclosing individual salary rows.
+    pub fn get_safe_treasury_summary(e: Env, asset: Address) -> SafeTreasurySummary {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        let total_balance = soroban_token::Client::new(&e, &asset).balance(&addrs.treasury);
+        let reserved_balance = Self::get_locked_funds(e.clone(), asset.clone());
+        let blocked_balance = 0i128;
+        let available_balance = total_balance
+            .checked_sub(reserved_balance)
+            .unwrap_or(0i128)
+            .checked_sub(blocked_balance)
+            .unwrap_or(0i128);
+
+        SafeTreasurySummary {
+            asset,
+            total_balance,
+            available_balance,
+            reserved_balance,
+            blocked_balance,
+        }
+    }
+
+    // ── Issue #403: Payroll Approval Expiry Validation ───────────────────────
+
+    /// Check whether an approval for a payroll run has expired (#403).
+    ///
+    /// Returns `true` if a review exists with decision `Approved` but `current_timestamp > reviewed_at + max_age_seconds`.
+    /// Returns `false` if the approval is within the validity window or if no approval exists.
+    pub fn is_payroll_approval_expired(e: Env, run_id: u64, max_age_seconds: u64) -> bool {
+        if let Some(review) = Self::get_run_review(e.clone(), run_id) {
+            if review.decision == ReviewDecision::Approved {
+                let current_time = e.ledger().timestamp();
+                let expiry_time = review.reviewed_at.saturating_add(max_age_seconds);
+                return current_time > expiry_time;
+            }
+        }
+        false
+    }
+
+    /// Validate that a payroll run approval is active and not expired (#403).
+    ///
+    /// # Panics
+    /// - If the approval for `run_id` has expired (older than `max_age_seconds`).
+    pub fn validate_approval_not_expired(e: &Env, run_id: u64, max_age_seconds: u64) {
+        if Self::is_payroll_approval_expired(e.clone(), run_id, max_age_seconds) {
+            panic!("Payroll approval expired: approval record exceeds maximum allowed age");
+        }
+    }
+
+    // ── Issue #404: Cancelled Batch Read Status Helper ───────────────────────
+
+    /// Read safe cancellation metadata for a cancelled payroll batch (#404).
+    ///
+    /// Returns `Some(CancelledBatchStatus)` if the batch was cancelled, containing
+    /// run_id, cancellation timestamp, admin address, cancellation reason symbol,
+    /// employee count, total amount, draft hash, and `is_cancelled: true`.
+    /// Returns `None` if the batch was not cancelled or does not exist.
+    pub fn get_cancelled_batch_status(e: Env, run_id: u64) -> Option<CancelledBatchStatus> {
+        e.storage()
+            .persistent()
+            .get(&DataKey::CancelledBatchRecord(run_id))
+    }
 }
 
 #[cfg(test)]
@@ -3612,7 +3772,7 @@ mod tests {
     use pause_manager::{PauseManager, PauseManagerClient};
     use proof_verifier::{ProofVerifier, VerificationKey};
     use salary_commitment::SalaryCommitmentContract;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
     use soroban_sdk::{Env, IntoVal};
 
     fn mock_proof(env: &Env) -> BytesN<256> {
@@ -7037,5 +7197,214 @@ mod tests {
         // Verify version was set
         let version = payroll_client.get_storage_version().unwrap();
         assert_eq!(version.version, 1);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // #401: Batch Lock Timestamp Query Helper Tests
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_batch_lock_timestamp_non_existent_run() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        assert_eq!(payroll_client.get_batch_lock_timestamp(&999), None);
+    }
+
+    #[test]
+    fn test_batch_lock_timestamp_pending_and_executed_runs() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 10_000);
+        let nonce = test_nonce(&env, 1);
+
+        // Prepare run
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &10_000,
+            &nonce,
+            &None,
+        );
+
+        let expected_lock_time = env.ledger().timestamp();
+        assert_eq!(
+            payroll_client.get_batch_lock_timestamp(&run_id),
+            Some(expected_lock_time)
+        );
+
+        // Finalize run
+        let addrs = payroll_client.get_addresses();
+        payroll_client.finalize_payroll_run(&addrs.admin, &run_id);
+
+        assert_eq!(
+            payroll_client.get_batch_lock_timestamp(&run_id),
+            Some(expected_lock_time)
+        );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // #402: Safe Treasury Balance Summary View Tests
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_safe_treasury_summary_view() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let addrs = payroll_client.get_addresses();
+        let summary_initial = payroll_client.get_safe_treasury_summary(&addrs.token);
+        assert_eq!(summary_initial.total_balance, 1_000_000);
+        assert_eq!(summary_initial.reserved_balance, 0);
+        assert_eq!(summary_initial.available_balance, 1_000_000);
+        assert_eq!(summary_initial.blocked_balance, 0);
+
+        // Lock funds via prepare_payroll_run
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 50_000);
+        let nonce = test_nonce(&env, 2);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &50_000,
+            &nonce,
+            &None,
+        );
+
+        let summary_locked = payroll_client.get_safe_treasury_summary(&addrs.token);
+        assert_eq!(summary_locked.total_balance, 1_000_000);
+        assert_eq!(summary_locked.reserved_balance, 50_000);
+        assert_eq!(summary_locked.available_balance, 950_000);
+        assert_eq!(summary_locked.blocked_balance, 0);
+
+        // Cancel run to release reservation
+        payroll_client.cancel_payroll_run(
+            &addrs.admin,
+            &run_id,
+            &Symbol::new(&env, "mistake"),
+        );
+
+        let summary_released = payroll_client.get_safe_treasury_summary(&addrs.token);
+        assert_eq!(summary_released.total_balance, 1_000_000);
+        assert_eq!(summary_released.reserved_balance, 0);
+        assert_eq!(summary_released.available_balance, 1_000_000);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // #403: Payroll Approval Expiry Validation Tests
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_payroll_approval_expiry_active_and_expired() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let reviewer = Address::generate(&env);
+        payroll_client.add_reviewer(&admin, &reviewer);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 10_000);
+        let nonce = test_nonce(&env, 3);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &10_000,
+            &nonce,
+            &None,
+        );
+
+        // Approve run
+        payroll_client.approve_payroll_run(&reviewer, &run_id);
+
+        // Fresh approval is not expired
+        assert!(!payroll_client.is_payroll_approval_expired(&run_id, &DEFAULT_APPROVAL_EXPIRY_SECONDS));
+
+        // Advance ledger timestamp beyond 7 days
+        env.ledger().with_mut(|li| {
+            li.timestamp += DEFAULT_APPROVAL_EXPIRY_SECONDS + 1;
+        });
+
+        // Now approval is expired
+        assert!(payroll_client.is_payroll_approval_expired(&run_id, &DEFAULT_APPROVAL_EXPIRY_SECONDS));
+    }
+
+    #[test]
+    #[should_panic(expected = "Payroll approval expired: approval record exceeds maximum allowed age")]
+    fn test_finalize_panics_on_expired_approval() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let reviewer = Address::generate(&env);
+        payroll_client.add_reviewer(&admin, &reviewer);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 10_000);
+        let nonce = test_nonce(&env, 4);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &10_000,
+            &nonce,
+            &None,
+        );
+
+        // Approve run
+        payroll_client.approve_payroll_run(&reviewer, &run_id);
+
+        // Advance ledger timestamp beyond 7 days
+        env.ledger().with_mut(|li| {
+            li.timestamp += DEFAULT_APPROVAL_EXPIRY_SECONDS + 10;
+        });
+
+        // Finalize should panic because approval is stale/expired
+        payroll_client.finalize_payroll_run(&admin, &run_id);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // #404: Cancelled Batch Read Status Helper Tests
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_cancelled_batch_status_read_helper() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        // Non-existent run
+        assert_eq!(payroll_client.get_cancelled_batch_status(&999), None);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 25_000);
+        let nonce = test_nonce(&env, 5);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &25_000,
+            &nonce,
+            &None,
+        );
+
+        // Active pending run is not cancelled
+        assert_eq!(payroll_client.get_cancelled_batch_status(&run_id), None);
+
+        // Cancel the run
+        let cancel_reason = Symbol::new(&env, "duplicate_order");
+        payroll_client.cancel_payroll_run(&admin, &run_id, &cancel_reason);
+
+        // Read cancelled status
+        let status = payroll_client.get_cancelled_batch_status(&run_id).unwrap();
+        assert_eq!(status.run_id, run_id);
+        assert_eq!(status.cancelled_by, admin);
+        assert_eq!(status.reason, cancel_reason);
+        assert_eq!(status.employee_count, 1);
+        assert_eq!(status.total_amount, 25_000);
+        assert!(status.is_cancelled);
     }
 }
