@@ -31,6 +31,19 @@ pub struct SalaryCommitment {
     pub revoked: bool,
 }
 
+/// Versioned salary commitment record scoped for payroll amendments
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct VersionedSalaryCommitment {
+    pub employer: Address,
+    pub employee: Address,
+    pub period: u64,
+    pub batch: u64,
+    pub commitment: BytesN<32>,
+    pub version: u32,
+    pub created_at: u64,
+}
+
 /// Nullifier to prevent double-spending
 #[contracttype]
 #[derive(Clone, Debug)]
