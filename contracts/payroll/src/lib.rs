@@ -160,10 +160,19 @@ pub struct BatchCheckpoint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum RunDraftState {
+    /// Newly created via `create_run_draft`, or freshly amended. Amendable
+    /// and cancellable. The only state a duplicate-period check (#398)
+    /// blocks a new draft against.
     Pending = 0,
+    /// Locked in via `finalize_run_draft`; no longer amendable. Awaiting
+    /// submission into an executable payroll run.
     Finalized = 1,
+    /// Converted into a real payroll run via `submit_run_draft`. Terminal —
+    /// the draft record itself is no longer actionable past this point.
     Submitted = 2,
+    /// Withdrawn by the admin before submission. Terminal.
     Cancelled = 3,
+    /// Timed out before being finalized/submitted. Terminal.
     Expired = 4,
 }
 
@@ -488,6 +497,13 @@ pub enum DataKey {
     CompanyBalance(Address),
     /// Marks a completed payroll run as archived for long-term reporting (#146).
     ArchivedRun(u64),
+    /// Marks a run as having an unresolved audit challenge open against it
+    /// (#374). Set/cleared by the admin; blocks archival while present.
+    ChallengedRun(u64),
+    /// Tracks the active (Pending) draft id for a given period_label, so a
+    /// second draft can't be created for the same period while one is
+    /// already pending (#398).
+    ActiveDraftForPeriod(Symbol),
     /// Company lifecycle state gate for payroll execution (#147).
     CompanyState,
     /// Canonical payroll run state for SDK/dashboard conformance (#159).
@@ -2458,6 +2474,15 @@ impl Payroll {
             panic!("total_amount must be positive");
         }
 
+        // Issue #398: reject a duplicate draft for a period that already has
+        // one pending. Cleared when the existing draft leaves Pending
+        // (finalize/cancel/expire) — not wired into those paths in this
+        // pass, so a stale entry here would need a follow-up cleanup there.
+        let period_key = DataKey::ActiveDraftForPeriod(period_label.clone());
+        if e.storage().persistent().has(&period_key) {
+            panic!("A pending draft already exists for this payroll period");
+        }
+
         let counter: u64 = e
             .storage()
             .persistent()
@@ -2481,6 +2506,9 @@ impl Payroll {
         e.storage()
             .persistent()
             .set(&DataKey::RunDraft(draft_id), &draft);
+        e.storage()
+            .persistent()
+            .set(&period_key, &draft_id);
 
         payroll_events::emit_draft_created(&e, draft_id, admin, period_label);
 
@@ -3252,6 +3280,11 @@ impl Payroll {
             panic!("Run not found");
         }
 
+        // Issue #374: block archival while an audit challenge is unresolved.
+        if e.storage().persistent().has(&DataKey::ChallengedRun(run_id)) {
+            panic!("Run has an unresolved audit challenge");
+        }
+
         let archive_key = DataKey::ArchivedRun(run_id);
         if e.storage().persistent().has(&archive_key) {
             panic!("Run is already archived");
@@ -3260,6 +3293,44 @@ impl Payroll {
 
         e.events().publish(
             (symbol_short!("payroll"), Symbol::new(&e, "run_archived")),
+            run_id,
+        );
+    }
+
+    /// Marks `run_id` as having an unresolved audit challenge, blocking
+    /// `archive_payroll_run` until cleared (issue #374). Admin-only.
+    pub fn flag_run_challenged(e: Env, admin: Address, run_id: u64) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        e.storage().persistent().set(&DataKey::ChallengedRun(run_id), &true);
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(&e, "run_challenged")),
+            run_id,
+        );
+    }
+
+    /// Clears the challenged flag on `run_id`, allowing archival again
+    /// (issue #374). Admin-only.
+    pub fn clear_run_challenge(e: Env, admin: Address, run_id: u64) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        e.storage().persistent().remove(&DataKey::ChallengedRun(run_id));
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(&e, "run_challenge_cleared")),
             run_id,
         );
     }

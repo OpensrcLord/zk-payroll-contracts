@@ -198,6 +198,23 @@ impl PayrollRegistry {
         }
     }
 
+    /// Validates an employer display-name/reference-id style metadata value
+    /// (issue #378): non-empty and within a reasonable length bound.
+    /// `CompanyInfo` does not yet store employer metadata fields, so this is
+    /// a standalone helper ready to be wired into a future
+    /// `set_company_metadata`-style entrypoint rather than a change to the
+    /// existing company record.
+    fn validate_employer_metadata_value(env: &Env, value: &String, field_name: &str) {
+        const MAX_METADATA_LEN: u32 = 256;
+        if value.len() == 0 {
+            panic!("{} must not be empty", field_name);
+        }
+        if value.len() > MAX_METADATA_LEN {
+            panic!("{} exceeds maximum length", field_name);
+        }
+        let _ = env; // reserved for a future emitted validation event
+    }
+
     pub fn set_pause_manager(env: Env, admin: Address, pause_manager: Address) {
         admin.require_auth();
         env.storage()
