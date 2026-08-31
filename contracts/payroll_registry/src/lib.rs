@@ -21,15 +21,15 @@ pub struct CompanyInfo {
     pub treasury: Address,
 }
 
-// ── Issue #90: employee eligibility ──────────────────────────────────────────
+// ?? Issue #90: employee eligibility ??????????????????????????????????????????
 
 /// Registration state for an employee.
 ///
 /// Eligibility checks use this to decide whether an employee can be included
 /// in a payroll execution:
-///   - `Active`     → eligible; commitment is registered and record is complete.
-///   - `Inactive`   → temporarily ineligible (e.g. on leave, terminated).
-///   - `Incomplete` → missing required registration data; never eligible until
+///   - `Active`     ? eligible; commitment is registered and record is complete.
+///   - `Inactive`   ? temporarily ineligible (e.g. on leave, terminated).
+///   - `Incomplete` ? missing required registration data; never eligible until
 ///                    the record is corrected and marked `Active`.
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,7 +40,7 @@ pub enum EmployeeStatus {
     Incomplete = 2,
 }
 
-// ── Issue #91: privileged-role rotation ──────────────────────────────────────
+// ?? Issue #91: privileged-role rotation ??????????????????????????????????????
 
 /// Pending two-step company admin or treasury rotation.
 ///
@@ -54,29 +54,14 @@ pub struct PendingCompanyRotation {
     pub proposed_at: u64,
 }
 
-// ── Issue #329: employer-level payroll policy ───────────────────────────────
-
-/// Employer-level payroll policy configuration (issue #329).
-#[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PayrollPolicy {
-    pub company_id: u64,
-    pub settlement_window: u64,
-    pub reserve_ratio_bps: u32,
-    pub approval_threshold: u32,
-    pub audit_retention_period: u64,
-    pub auto_settlement_enabled: bool,
-}
-
 /// Storage key space for the payroll registry.
 ///
-/// - `Company(u64)`               → `CompanyInfo`              (Persistent)
-/// - `Employee(u64, Address)`     → `BytesN<32>`               (Persistent, commitment)
-/// - `EmpStatus(u64, Address)`    → `EmployeeStatus`           (Persistent, eligibility)
-/// - `CompanySequence`            → `u64`                      (Persistent, counter)
-/// - `PendingAdminRotation(u64)`  → `PendingCompanyRotation`   (Persistent, issue #91)
-/// - `PendingTreasuryRotation(u64)` → `PendingCompanyRotation` (Persistent, issue #91)
-/// - `PayrollPolicy(u64)`         → `PayrollPolicy`            (Persistent, issue #329)
+/// - `Company(u64)`               ? `CompanyInfo`              (Persistent)
+/// - `Employee(u64, Address)`     ? `BytesN<32>`               (Persistent, commitment)
+/// - `EmpStatus(u64, Address)`    ? `EmployeeStatus`           (Persistent, eligibility)
+/// - `CompanySequence`            ? `u64`                      (Persistent, counter)
+/// - `PendingAdminRotation(u64)`  ? `PendingCompanyRotation`   (Persistent, issue #91)
+/// - `PendingTreasuryRotation(u64)` ? `PendingCompanyRotation` (Persistent, issue #91)
 #[contracttype]
 pub enum DataKey {
     Company(u64),
@@ -92,12 +77,10 @@ pub enum DataKey {
     CompanyAdmin(Address),
     /// Pause manager address (issue #167).
     PauseManager,
-    /// Employer-level payroll policy (issue #329).
-    PayrollPolicy(u64),
 }
 
 // ---------------------------------------------------------------------------
-// Trait — canonical interface specification for #12
+// Trait ? canonical interface specification for #12
 // ---------------------------------------------------------------------------
 
 pub trait PayrollRegistryTrait {
@@ -136,7 +119,7 @@ pub trait PayrollRegistryTrait {
     /// Read an employee's active commitment under a company.
     fn get_commitment(env: Env, company_id: u64, employee: Address) -> BytesN<32>;
 
-    // ── Issue #90: employee eligibility ──────────────────────────────────────
+    // ?? Issue #90: employee eligibility ??????????????????????????????????????
 
     /// Set the eligibility status for a registered employee.
     /// Requires authorisation from the company admin.
@@ -149,7 +132,10 @@ pub trait PayrollRegistryTrait {
     /// Return `true` iff the employee is registered AND has `Active` status.
     fn is_eligible(env: Env, company_id: u64, employee: Address) -> bool;
 
-    // ── Issue #91: company-level admin/treasury rotation ─────────────────────
+    /// Read-only helper for clients that only need active/inactive state.
+    fn is_employee_active(env: Env, company_id: u64, employee: Address) -> bool;
+
+    // ?? Issue #91: company-level admin/treasury rotation ?????????????????????
 
     /// Propose a new company admin (step 1 of 2).
     fn propose_admin_rotation(
@@ -178,15 +164,6 @@ pub trait PayrollRegistryTrait {
 
     /// Cancel a pending treasury rotation.
     fn cancel_treasury_rotation(env: Env, company_id: u64, current_admin: Address);
-
-    // ── Issue #329: Employer-level payroll policy registry ───────────────────
-
-    /// Configure or update employer-level payroll policy.
-    /// Requires authorisation from the company admin.
-    fn set_payroll_policy(env: Env, company_id: u64, policy: PayrollPolicy);
-
-    /// Retrieve employer-level payroll policy if configured.
-    fn get_payroll_policy(env: Env, company_id: u64) -> Option<PayrollPolicy>;
 
     /// Return the current company sequence counter (defaults to 0).
     fn get_company_sequence(env: Env) -> u64;
@@ -460,7 +437,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .expect("Employee not found")
     }
 
-    // ── Issue #90: employee eligibility ──────────────────────────────────────
+    // ?? Issue #90: employee eligibility ??????????????????????????????????????
 
     fn set_employee_status(env: Env, company_id: u64, employee: Address, status: EmployeeStatus) {
         Self::require_not_paused(&env);
@@ -519,6 +496,10 @@ impl PayrollRegistryTrait for PayrollRegistry {
     }
 
     fn is_eligible(env: Env, company_id: u64, employee: Address) -> bool {
+        Self::is_employee_active(env, company_id, employee)
+    }
+
+    fn is_employee_active(env: Env, company_id: u64, employee: Address) -> bool {
         if !env
             .storage()
             .persistent()
@@ -534,7 +515,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
         status == EmployeeStatus::Active
     }
 
-    // ── Issue #91: company-level admin/treasury rotation ─────────────────────
+    // ?? Issue #91: company-level admin/treasury rotation ?????????????????????
 
     fn propose_admin_rotation(
         env: Env,
@@ -736,54 +717,6 @@ impl PayrollRegistryTrait for PayrollRegistry {
             (Symbol::new(&env, "TreasuryRotationCancelled"), company_id),
             (current_admin,),
         );
-    }
-
-    // ── Issue #329: Employer-level payroll policy registry ───────────────────
-
-    fn set_payroll_policy(env: Env, company_id: u64, policy: PayrollPolicy) {
-        Self::require_not_paused(&env);
-        let info: CompanyInfo = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Company(company_id))
-            .expect("Company not found");
-        info.admin.require_auth();
-
-        if policy.company_id != company_id {
-            panic!("Company ID in policy does not match target company");
-        }
-        if policy.settlement_window == 0 {
-            panic!("Settlement window must be greater than 0");
-        }
-        if policy.reserve_ratio_bps > 10_000 {
-            panic!("Reserve ratio bps cannot exceed 10000");
-        }
-        if policy.approval_threshold == 0 {
-            panic!("Approval threshold must be greater than 0");
-        }
-        if policy.audit_retention_period == 0 {
-            panic!("Audit retention period must be greater than 0");
-        }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::PayrollPolicy(company_id), &policy);
-
-        payroll_events::emit_payroll_policy_set(
-            &env,
-            company_id,
-            policy.settlement_window,
-            policy.reserve_ratio_bps,
-            policy.approval_threshold,
-            policy.audit_retention_period,
-            policy.auto_settlement_enabled,
-        );
-    }
-
-    fn get_payroll_policy(env: Env, company_id: u64) -> Option<PayrollPolicy> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PayrollPolicy(company_id))
     }
 
     fn get_company_sequence(env: Env) -> u64 {
