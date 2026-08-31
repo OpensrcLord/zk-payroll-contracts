@@ -54,6 +54,34 @@ pub struct PendingCompanyRotation {
     pub proposed_at: u64,
 }
 
+// ?? Issue #353: Approver Threshold Rotation Controls ???????????????????????????
+
+/// Approval threshold configuration for payroll authorization (#353).
+///
+/// Thresholds determine how many approvals are required before a payroll run
+/// can be executed. Rotating thresholds allows changes without invalidating
+/// already locked payroll decisions.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ApprovalThreshold {
+    pub company_id: u64,
+    pub required_approvals: u32,
+    pub configured_at: u64,
+    pub configured_by: Address,
+    pub is_active: bool,
+}
+
+/// Pending threshold rotation awaiting activation (#353).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PendingThresholdRotation {
+    pub company_id: u64,
+    pub new_threshold: u32,
+    pub proposed_at: u64,
+    pub proposed_by: Address,
+    pub effective_after: u64,
+}
+
 /// Storage key space for the payroll registry.
 ///
 /// - `Company(u64)`               ? `CompanyInfo`              (Persistent)
@@ -62,6 +90,8 @@ pub struct PendingCompanyRotation {
 /// - `CompanySequence`            ? `u64`                      (Persistent, counter)
 /// - `PendingAdminRotation(u64)`  ? `PendingCompanyRotation`   (Persistent, issue #91)
 /// - `PendingTreasuryRotation(u64)` ? `PendingCompanyRotation` (Persistent, issue #91)
+/// - `ApprovalThreshold(u64)`     ? `ApprovalThreshold`        (Persistent, issue #353)
+/// - `PendingThresholdRotation(u64)` ? `PendingThresholdRotation` (Persistent, issue #353)
 #[contracttype]
 pub enum DataKey {
     Company(u64),
@@ -77,6 +107,10 @@ pub enum DataKey {
     CompanyAdmin(Address),
     /// Pause manager address (issue #167).
     PauseManager,
+    /// Active approval threshold for a company (issue #353).
+    ApprovalThreshold(u64),
+    /// Pending approval threshold rotation (issue #353).
+    PendingThresholdRotation(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +207,33 @@ pub trait PayrollRegistryTrait {
 
     /// Return any pending treasury rotation proposal for a company.
     fn get_pending_treasury_rotation(env: Env, company_id: u64) -> Option<PendingCompanyRotation>;
+
+    // ?? Issue #353: Approver Threshold Rotation Controls ???????????????????????????
+
+    /// Propose a new approval threshold for a company (step 1 of 2).
+    /// The new threshold becomes effective after a grace period.
+    fn propose_threshold_rotation(
+        env: Env,
+        company_id: u64,
+        admin: Address,
+        new_threshold: u32,
+        grace_period_seconds: u64,
+    );
+
+    /// Activate a pending threshold rotation after the grace period expires (#353).
+    fn activate_threshold_rotation(env: Env, company_id: u64, admin: Address);
+
+    /// Cancel a pending threshold rotation before it takes effect.
+    fn cancel_threshold_rotation(env: Env, company_id: u64, admin: Address);
+
+    /// Get the current approval threshold for a company (#353).
+    fn get_approval_threshold(env: Env, company_id: u64) -> Option<ApprovalThreshold>;
+
+    /// Get any pending approval threshold rotation for a company (#353).
+    fn get_pending_threshold_rotation(env: Env, company_id: u64) -> Option<PendingThresholdRotation>;
+
+    /// Set the initial approval threshold when a company is registered (#353).
+    fn set_initial_approval_threshold(env: Env, company_id: u64, admin: Address, required_approvals: u32);
 }
 
 // ---------------------------------------------------------------------------
@@ -753,6 +814,180 @@ impl PayrollRegistryTrait for PayrollRegistry {
         env.storage()
             .persistent()
             .get(&DataKey::PendingTreasuryRotation(company_id))
+    }
+
+    // ?? Issue #353: Approver Threshold Rotation Controls ???????????????????????????
+
+    fn propose_threshold_rotation(
+        env: Env,
+        company_id: u64,
+        admin: Address,
+        new_threshold: u32,
+        grace_period_seconds: u64,
+    ) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+
+        let company = env
+            .storage()
+            .persistent()
+            .get::<DataKey, CompanyInfo>(&DataKey::Company(company_id))
+            .expect("Company not found");
+
+        if company.admin != admin {
+            panic!("Only company admin can propose threshold rotation");
+        }
+
+        if new_threshold == 0 {
+            panic!("Threshold must be at least 1");
+        }
+
+        let effective_after = env.ledger().timestamp() + grace_period_seconds;
+
+        let pending = PendingThresholdRotation {
+            company_id,
+            new_threshold,
+            proposed_at: env.ledger().timestamp(),
+            proposed_by: admin.clone(),
+            effective_after,
+        };
+
+        env.storage().persistent().set(
+            &DataKey::PendingThresholdRotation(company_id),
+            &pending,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "ThresholdRotationProposed"), company_id),
+            (new_threshold, effective_after),
+        );
+    }
+
+    fn activate_threshold_rotation(env: Env, company_id: u64, admin: Address) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+
+        let company = env
+            .storage()
+            .persistent()
+            .get::<DataKey, CompanyInfo>(&DataKey::Company(company_id))
+            .expect("Company not found");
+
+        if company.admin != admin {
+            panic!("Only company admin can activate threshold rotation");
+        }
+
+        let pending = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PendingThresholdRotation>(&DataKey::PendingThresholdRotation(company_id))
+            .expect("No pending threshold rotation");
+
+        if env.ledger().timestamp() < pending.effective_after {
+            panic!("Threshold rotation is still in grace period");
+        }
+
+        let threshold = ApprovalThreshold {
+            company_id,
+            required_approvals: pending.new_threshold,
+            configured_at: env.ledger().timestamp(),
+            configured_by: admin.clone(),
+            is_active: true,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ApprovalThreshold(company_id), &threshold);
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingThresholdRotation(company_id));
+
+        env.events().publish(
+            (Symbol::new(&env, "ThresholdRotationActivated"), company_id),
+            (pending.new_threshold, env.ledger().timestamp()),
+        );
+    }
+
+    fn cancel_threshold_rotation(env: Env, company_id: u64, admin: Address) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+
+        let company = env
+            .storage()
+            .persistent()
+            .get::<DataKey, CompanyInfo>(&DataKey::Company(company_id))
+            .expect("Company not found");
+
+        if company.admin != admin {
+            panic!("Only company admin can cancel threshold rotation");
+        }
+
+        let pending = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PendingThresholdRotation>(&DataKey::PendingThresholdRotation(company_id))
+            .expect("No pending threshold rotation");
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingThresholdRotation(company_id));
+
+        env.events().publish(
+            (Symbol::new(&env, "ThresholdRotationCancelled"), company_id),
+            (pending.new_threshold, env.ledger().timestamp()),
+        );
+    }
+
+    fn get_approval_threshold(env: Env, company_id: u64) -> Option<ApprovalThreshold> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ApprovalThreshold(company_id))
+    }
+
+    fn get_pending_threshold_rotation(env: Env, company_id: u64) -> Option<PendingThresholdRotation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingThresholdRotation(company_id))
+    }
+
+    fn set_initial_approval_threshold(
+        env: Env,
+        company_id: u64,
+        admin: Address,
+        required_approvals: u32,
+    ) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+
+        if required_approvals == 0 {
+            panic!("Threshold must be at least 1");
+        }
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::ApprovalThreshold(company_id))
+        {
+            panic!("Approval threshold already configured for this company");
+        }
+
+        let threshold = ApprovalThreshold {
+            company_id,
+            required_approvals,
+            configured_at: env.ledger().timestamp(),
+            configured_by: admin.clone(),
+            is_active: true,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ApprovalThreshold(company_id), &threshold);
+
+        env.events().publish(
+            (Symbol::new(&env, "InitialThresholdConfigured"), company_id),
+            (required_approvals, env.ledger().timestamp()),
+        );
     }
 }
 

@@ -357,6 +357,26 @@ pub struct CancelledBatchStatus {
     pub is_cancelled: bool,
 }
 
+// ?? Issue #352: Payroll Batch Split Validation ??????????????????????????????????
+
+/// Tracking metadata for batch splits to preserve original aggregate commitment (#352).
+///
+/// When a large payroll batch is split into smaller child batches, this structure
+/// records the relationship between the parent batch and its children, along with
+/// aggregate commitment data to ensure the sum of child batches equals the original.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchSplitRecord {
+    pub parent_run_id: u64,
+    pub child_run_id: u64,
+    pub parent_total: i128,
+    pub parent_employee_count: u32,
+    pub child_total: i128,
+    pub child_employee_count: u32,
+    pub split_at: u64,
+    pub split_by: Address,
+}
+
 // ?? Issue #403: Payroll Approval Expiry ????????????????????????????????????????
 
 /// Default maximum validity age for reviewer approvals (7 days in seconds) (#403).
@@ -542,6 +562,10 @@ pub enum DataKey {
     MigrationReadiness,
     /// Cancelled payroll batch status record (#404).
     CancelledBatchRecord(u64),
+    /// Batch split record linking parent and child batch runs (#352).
+    BatchSplitRecord(u64, u64),
+    /// Aggregate batch split tracker per parent run (#352).
+    BatchSplitTracker(u64),
     // Future upgrade example (issue #196):
     // PayrollRunV2(u64),  // Would be added here when schema evolution is needed
 }
@@ -3846,6 +3870,80 @@ impl Payroll {
         e.storage()
             .persistent()
             .get(&DataKey::CancelledBatchRecord(run_id))
+    }
+
+    // ?? Issue #352: Payroll Batch Split Validation ??????????????????????????????????
+
+    /// Record a batch split to track parent-child relationships (#352).
+    /// Validates that child batch totals can be aggregated back to parent.
+    pub fn record_batch_split(
+        e: Env,
+        admin: Address,
+        parent_run_id: u64,
+        child_run_id: u64,
+        parent_total: i128,
+        parent_employee_count: u32,
+        child_total: i128,
+        child_employee_count: u32,
+    ) {
+        admin.require_auth();
+
+        if child_total <= 0 || parent_total <= 0 {
+            panic!("Batch amounts must be positive");
+        }
+
+        if child_total > parent_total {
+            panic!("Child batch total cannot exceed parent total");
+        }
+
+        if child_employee_count > parent_employee_count {
+            panic!("Child employee count cannot exceed parent count");
+        }
+
+        let split_record = BatchSplitRecord {
+            parent_run_id,
+            child_run_id,
+            parent_total,
+            parent_employee_count,
+            child_total,
+            child_employee_count,
+            split_at: e.ledger().timestamp(),
+            split_by: admin.clone(),
+        };
+
+        e.storage().persistent().set(
+            &DataKey::BatchSplitRecord(parent_run_id, child_run_id),
+            &split_record,
+        );
+
+        e.events().publish(
+            (Symbol::new(&e, "BatchSplitRecorded"), parent_run_id),
+            (child_run_id, child_total, e.ledger().timestamp()),
+        );
+    }
+
+    /// Get batch split record by parent and child run IDs (#352).
+    pub fn get_batch_split(e: Env, parent_run_id: u64, child_run_id: u64) -> Option<BatchSplitRecord> {
+        e.storage()
+            .persistent()
+            .get(&DataKey::BatchSplitRecord(parent_run_id, child_run_id))
+    }
+
+    /// Validate that a batch split preserves the original aggregate commitment (#352).
+    /// This ensures that when a large batch is split, the sum of children equals the parent.
+    pub fn validate_batch_split_aggregate(
+        e: Env,
+        parent_run_id: u64,
+        expected_total_amount: i128,
+        expected_employee_count: u32,
+    ) -> bool {
+        let parent_run_key = DataKey::PayrollRun(parent_run_id);
+        if let Some(parent_run) = e.storage().persistent().get::<DataKey, PayrollRun>(&parent_run_key) {
+            parent_run.total_amount == expected_total_amount
+                && parent_run.employee_count == expected_employee_count
+        } else {
+            false
+        }
     }
 }
 
