@@ -2,7 +2,7 @@
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token as soroban_token, Address, BytesN,
-    Env, Symbol, Vec,
+    Env, String, Symbol, Vec,
 };
 
 use pause_manager::PauseManagerClient;
@@ -193,6 +193,8 @@ pub struct PayrollRunDraft {
     pub state: RunDraftState,
     pub amendment_count: u32,
 }
+
+const MAX_DRAFT_DESCRIPTION_BYTES: u32 = 256;
 
 // ?? Reviewer Authorization & Run Review ?????????????????????????????????????
 
@@ -499,6 +501,8 @@ pub enum DataKey {
     RunCounter,
     /// Draft run storage for the amendment flow (issue #89).
     RunDraft(u64),
+    /// Optional human-readable description for a draft (issue #420).
+    DraftDescription(u64),
     /// Auto-increment counter for draft IDs (issue #89).
     RunDraftCounter,
     /// Pending admin rotation proposal (issue #91).
@@ -816,6 +820,26 @@ impl Payroll {
     fn validate_draft_id(draft_id: u64) {
         if draft_id == 0 {
             panic!("Invalid draft ID: must be non-zero");
+        }
+    }
+
+    fn validate_draft_description(description: &String) {
+        let bytes = description.to_bytes();
+        if bytes.len() == 0 {
+            panic!("Description cannot be blank");
+        }
+        if bytes.len() > MAX_DRAFT_DESCRIPTION_BYTES {
+            panic!("Description exceeds 256 bytes");
+        }
+        let mut has_non_whitespace = false;
+        for byte in bytes.iter() {
+            if byte != 9 && byte != 10 && byte != 13 && byte != 32 {
+                has_non_whitespace = true;
+                break;
+            }
+        }
+        if !has_non_whitespace {
+            panic!("Description cannot be blank");
         }
     }
 
@@ -2676,13 +2700,46 @@ impl Payroll {
         e.storage()
             .persistent()
             .set(&DataKey::RunDraft(draft_id), &draft);
-        e.storage()
-            .persistent()
-            .set(&period_key, &draft_id);
+        e.storage().persistent().set(&period_key, &draft_id);
 
         payroll_events::emit_draft_created(&e, draft_id, admin, period_label);
 
         draft_id
+    }
+
+    /// Save an optional description for a pending draft. Blank descriptions
+    /// are rejected and the byte limit keeps metadata bounded on-chain.
+    pub fn set_run_draft_description(e: Env, admin: Address, draft_id: u64, description: String) {
+        Self::require_not_paused(&e);
+        Self::validate_draft_id(draft_id);
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        let draft: PayrollRunDraft = e
+            .storage()
+            .persistent()
+            .get(&DataKey::RunDraft(draft_id))
+            .expect("Draft not found");
+        if draft.state != RunDraftState::Pending {
+            panic!("Only pending drafts can be amended");
+        }
+        Self::validate_draft_description(&description);
+        e.storage()
+            .persistent()
+            .set(&DataKey::DraftDescription(draft_id), &description);
+    }
+
+    pub fn get_run_draft_description(e: Env, draft_id: u64) -> Option<String> {
+        Self::validate_draft_id(draft_id);
+        e.storage()
+            .persistent()
+            .get(&DataKey::DraftDescription(draft_id))
     }
 
     /// Amend a `Pending` payroll run draft before finalization.
@@ -3470,7 +3527,10 @@ impl Payroll {
         }
 
         // Issue #374: block archival while an audit challenge is unresolved.
-        if e.storage().persistent().has(&DataKey::ChallengedRun(run_id)) {
+        if e.storage()
+            .persistent()
+            .has(&DataKey::ChallengedRun(run_id))
+        {
             panic!("Run has an unresolved audit challenge");
         }
 
@@ -3498,7 +3558,9 @@ impl Payroll {
             panic!("Unauthorized");
         }
         admin.require_auth();
-        e.storage().persistent().set(&DataKey::ChallengedRun(run_id), &true);
+        e.storage()
+            .persistent()
+            .set(&DataKey::ChallengedRun(run_id), &true);
         e.events().publish(
             (symbol_short!("payroll"), Symbol::new(&e, "run_challenged")),
             run_id,
@@ -3517,9 +3579,14 @@ impl Payroll {
             panic!("Unauthorized");
         }
         admin.require_auth();
-        e.storage().persistent().remove(&DataKey::ChallengedRun(run_id));
+        e.storage()
+            .persistent()
+            .remove(&DataKey::ChallengedRun(run_id));
         e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "run_challenge_cleared")),
+            (
+                symbol_short!("payroll"),
+                Symbol::new(&e, "run_challenge_cleared"),
+            ),
             run_id,
         );
     }
@@ -4088,7 +4155,11 @@ impl Payroll {
     }
 
     /// Get batch split record by parent and child run IDs (#352).
-    pub fn get_batch_split(e: Env, parent_run_id: u64, child_run_id: u64) -> Option<BatchSplitRecord> {
+    pub fn get_batch_split(
+        e: Env,
+        parent_run_id: u64,
+        child_run_id: u64,
+    ) -> Option<BatchSplitRecord> {
         e.storage()
             .persistent()
             .get(&DataKey::BatchSplitRecord(parent_run_id, child_run_id))
@@ -4103,7 +4174,11 @@ impl Payroll {
         expected_employee_count: u32,
     ) -> bool {
         let parent_run_key = DataKey::PayrollRun(parent_run_id);
-        if let Some(parent_run) = e.storage().persistent().get::<DataKey, PayrollRun>(&parent_run_key) {
+        if let Some(parent_run) = e
+            .storage()
+            .persistent()
+            .get::<DataKey, PayrollRun>(&parent_run_key)
+        {
             parent_run.total_amount == expected_total_amount
                 && parent_run.employee_count == expected_employee_count
         } else {
@@ -4115,12 +4190,12 @@ impl Payroll {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ::token::{Token, TokenClient};
     use pause_manager::{PauseManager, PauseManagerClient};
     use proof_verifier::{ProofVerifier, VerificationKey};
     use salary_commitment::SalaryCommitmentContract;
     use soroban_sdk::testutils::{Address as _, Ledger as _};
     use soroban_sdk::{Env, IntoVal};
+    use token::{Token, TokenClient};
 
     fn mock_proof(env: &Env) -> BytesN<256> {
         BytesN::from_array(env, &[0u8; 256])
@@ -4535,6 +4610,30 @@ mod tests {
         assert_eq!(draft.total_amount, 10_000i128);
         assert_eq!(draft.employee_count, 20u32);
         assert_eq!(draft.amendment_count, 0u32);
+    }
+
+    #[test]
+    fn test_draft_description_rejects_blank_and_overlong_values() {
+        let env = Env::default();
+        let (client, admin, _treasury, _owner, _employee) = setup_simple_payroll(&env);
+        let id = client.create_run_draft(&admin, &1_000i128, &1u32, &Symbol::new(&env, "DESC"));
+        client.set_run_draft_description(
+            &admin,
+            &id,
+            &soroban_sdk::String::from_str(&env, "Quarterly payroll"),
+        );
+        assert_eq!(
+            client.get_run_draft_description(&id),
+            Some(soroban_sdk::String::from_str(&env, "Quarterly payroll"))
+        );
+        let blank = soroban_sdk::String::from_str(&env, "   ");
+        assert!(client
+            .try_set_run_draft_description(&admin, &id, &blank)
+            .is_err());
+        let long = soroban_sdk::String::from_str(&env, &"x".repeat(257));
+        assert!(client
+            .try_set_run_draft_description(&admin, &id, &long)
+            .is_err());
     }
 
     #[test]
@@ -7569,14 +7668,8 @@ mod tests {
         let nonce = test_nonce(&env, 1);
 
         // Prepare run
-        let run_id = payroll_client.prepare_payroll_run(
-            &proofs,
-            &amounts,
-            &employees,
-            &10_000,
-            &nonce,
-            &None,
-        );
+        let run_id = payroll_client
+            .prepare_payroll_run(&proofs, &amounts, &employees, &10_000, &nonce, &None);
 
         let expected_lock_time = env.ledger().timestamp();
         assert_eq!(
@@ -7614,14 +7707,8 @@ mod tests {
         // Lock funds via prepare_payroll_run
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 50_000);
         let nonce = test_nonce(&env, 2);
-        let run_id = payroll_client.prepare_payroll_run(
-            &proofs,
-            &amounts,
-            &employees,
-            &50_000,
-            &nonce,
-            &None,
-        );
+        let run_id = payroll_client
+            .prepare_payroll_run(&proofs, &amounts, &employees, &50_000, &nonce, &None);
 
         let summary_locked = payroll_client.get_safe_treasury_summary(&addrs.token);
         assert_eq!(summary_locked.total_balance, 1_000_000);
@@ -7630,11 +7717,7 @@ mod tests {
         assert_eq!(summary_locked.blocked_balance, 0);
 
         // Cancel run to release reservation
-        payroll_client.cancel_payroll_run(
-            &addrs.admin,
-            &run_id,
-            &Symbol::new(&env, "mistake"),
-        );
+        payroll_client.cancel_payroll_run(&addrs.admin, &run_id, &Symbol::new(&env, "mistake"));
 
         let summary_released = payroll_client.get_safe_treasury_summary(&addrs.token);
         assert_eq!(summary_released.total_balance, 1_000_000);
@@ -7657,20 +7740,16 @@ mod tests {
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 10_000);
         let nonce = test_nonce(&env, 3);
-        let run_id = payroll_client.prepare_payroll_run(
-            &proofs,
-            &amounts,
-            &employees,
-            &10_000,
-            &nonce,
-            &None,
-        );
+        let run_id = payroll_client
+            .prepare_payroll_run(&proofs, &amounts, &employees, &10_000, &nonce, &None);
 
         // Approve run
         payroll_client.approve_payroll_run(&reviewer, &run_id);
 
         // Fresh approval is not expired
-        assert!(!payroll_client.is_payroll_approval_expired(&run_id, &DEFAULT_APPROVAL_EXPIRY_SECONDS));
+        assert!(
+            !payroll_client.is_payroll_approval_expired(&run_id, &DEFAULT_APPROVAL_EXPIRY_SECONDS)
+        );
 
         // Advance ledger timestamp beyond 7 days
         env.ledger().with_mut(|li| {
@@ -7678,11 +7757,15 @@ mod tests {
         });
 
         // Now approval is expired
-        assert!(payroll_client.is_payroll_approval_expired(&run_id, &DEFAULT_APPROVAL_EXPIRY_SECONDS));
+        assert!(
+            payroll_client.is_payroll_approval_expired(&run_id, &DEFAULT_APPROVAL_EXPIRY_SECONDS)
+        );
     }
 
     #[test]
-    #[should_panic(expected = "Payroll approval expired: approval record exceeds maximum allowed age")]
+    #[should_panic(
+        expected = "Payroll approval expired: approval record exceeds maximum allowed age"
+    )]
     fn test_finalize_panics_on_expired_approval() {
         let env = Env::default();
         let (payroll_client, admin, _treasury, _treasury_owner, employee) =
@@ -7693,14 +7776,8 @@ mod tests {
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 10_000);
         let nonce = test_nonce(&env, 4);
-        let run_id = payroll_client.prepare_payroll_run(
-            &proofs,
-            &amounts,
-            &employees,
-            &10_000,
-            &nonce,
-            &None,
-        );
+        let run_id = payroll_client
+            .prepare_payroll_run(&proofs, &amounts, &employees, &10_000, &nonce, &None);
 
         // Approve run
         payroll_client.approve_payroll_run(&reviewer, &run_id);
@@ -7729,14 +7806,8 @@ mod tests {
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 25_000);
         let nonce = test_nonce(&env, 5);
-        let run_id = payroll_client.prepare_payroll_run(
-            &proofs,
-            &amounts,
-            &employees,
-            &25_000,
-            &nonce,
-            &None,
-        );
+        let run_id = payroll_client
+            .prepare_payroll_run(&proofs, &amounts, &employees, &25_000, &nonce, &None);
 
         // Active pending run is not cancelled
         assert_eq!(payroll_client.get_cancelled_batch_status(&run_id), None);
