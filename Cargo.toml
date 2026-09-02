@@ -4,6 +4,8 @@ members = [
     "contracts/*",
     "cli",
     "tests/migrations",
+    "tests/admin",
+    "tests/company-state",
     "tests/metadata",
     "tests/state",
     "tests/storage",
@@ -12,7 +14,7 @@ members = [
     "tests/event_schema",
     "tests/init_matrix",
 ]
-exclude = ["fuzz"]
+exclude = ["fuzz", "contracts/tests"]
 
 
 [workspace.package]
